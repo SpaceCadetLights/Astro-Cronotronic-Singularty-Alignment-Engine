@@ -1,60 +1,102 @@
 /*
-  clock_engine.cpp
-  Extremely defensive version – no out-of-context parser calls
+  clock_engine.cpp  —  ultra-safe skeleton
+  ✓ No FreeRTOS timers
+  ✓ All parser calls happen in GRBL main context (user_routine, macro)
+  ✓ Clear Serial prints so you can see each step
 */
 
-#include "../src/grbl.h"          // GRBL core
-#include "../src/Realtime.h"      // realtime command helpers
-#include <Arduino.h>
-#include <cstring>
+#include "../src/Grbl.h"     // GRBL core types
+#include "../src/GCode.h"    // gc_execute_line prototype
+#include <Arduino.h>         // Serial
+#include <cstring>           // strncpy
 
-/* ---------------- debug helper ---------------- */
-static void dbg(const char *s){ Serial.println(s); }
+// ---------- tiny debug helper ----------
+static void dbg(const char* s) { Serial.println(s); }
 
-/* ---------------- flag section ---------------- */
-static bool need_home       = true;   // we’ll home once in main loop
-static bool need_zero_after = false;  // move to 12:00 after homing
+// ---------- flags ----------
+static bool need_home        = true;  // request homing once
+static bool zero_sent = false;   // tracks if G0 X0 Y0 has been issued
 
-/* ---------------- helpers --------------------- */
-static void queue_home()   { enqueueRealtimeCommand(CMD_HOMING_CYCLE_START); }
-static void queue_zero()   { enqueueRealtimeCommand(CMD_FEED_HOLD); /* flush */ 
-                             gc_execute_line(const_cast<char*>("G90"), 0);
-                             gc_execute_line(const_cast<char*>("G0 X0 Y0 F2000"), 0); }
-                              // ← executed only from main loop, safe
-
-/* ------------- GRBL hook: machine_init() ------ */
-void machine_init()
+// ---------- safe G-code sender ----------
+static void send_gcode(const char *line)
 {
-  dbg("machine_init()");
-  /* nothing else – wait for GRBL main loop */
+  static char buf[96];
+  strncpy(buf, line, sizeof(buf)-1);
+  buf[sizeof(buf)-1] = '\0';
+  /* execute in GRBL main task (user_routine / macro) */
+  gc_execute_line(buf, 0);   // client 0 = internal USB
 }
 
-/* ------------- GRBL hook: called very often ---- */
-void user_routine()
+// ---------- GRBL hook: runs once at boot ----------
+void machine_init(void)
 {
-  /* this runs in GRBL main task – it’s safe to parse G-code here */
-  if (need_home && sys.state == State::Idle) {
-      dbg("queuing home");
-      queue_home();
-      need_home = false;
-      need_zero_after = true;
-  }
+  dbg("machine_init() – waiting for GRBL idle…");
+  WebUI::inputBuffer.push("$H\r");  // home machine
+  /* nothing else – everything happens in user_routine() */
+}
 
-  if (need_zero_after && sys.state == State::Idle && !sys.homing_flag) {
-      dbg("queuing zero");
-      queue_zero();
-      need_zero_after = false;
+// ---------- GRBL hook: called very often in main loop ----------
+void user_routine(void)
+{
+  // /* 1) if we still need to home and machine is idle → send $H */
+  // if (need_home && sys.state == State::Idle)
+  // {
+  //   dbg("queue $H");
+  //   send_gcode("$H");
+  //   need_home = false;
+  //   /* when homing starts sys.state will go to Homing */
+  // }
+
+  // /* 2) once homing completed and idle, send zero move once */
+  // if (!zero_sent && !need_home && sys.state == State::Idle)
+  // {
+  //   dbg("queue zero move");
+  //   send_gcode("G90");
+  //   send_gcode("G0 X0 Y0 F2000");
+  //   zero_sent = true;
+  // }
+
+    
+  //   static uint32_t last = 0;
+  //   if (millis() - last > 1000) {   // every second
+  //       dbg("user_routine alive");
+  //       last = millis();
+  //   }
+}
+  
+
+
+
+// ---------- Macro buttons from Web UI ----------
+void user_defined_macro(uint8_t idx)
+{
+  char m[24];
+  sprintf(m,"macro %u",idx); dbg(m);
+
+  switch (idx)
+  {
+    case 1:  send_gcode("$Play=/spin420.nc");          break;          // play file
+    case 2:  send_gcode("G0 X120 Y130 F12000");        break;          // snap to 4:20
+    case 3:  need_home = true; zero_sent = false;      break;          // re-home
+    default: break;
   }
 }
 
-/* ------------- user macro buttons -------------- */
-void user_defined_macro(uint8_t id)
+/* --------------- OPTIONAL: M900 HH:MM --------------- */
+bool gcode_unknown_command_execute(char *line)
 {
-  // triggered from Web UI (runs in main task)
-  switch(id){
-    case 0: need_home = true; break;                 // “Home” button
-    case 1: gc_execute_line(const_cast<char*>("$Play=/spin420.nc"), 0); break;
-    case 2: gc_execute_line(const_cast<char*>("G0 X120 Y130 F12000"), 0); break; // 4:20
-    // add more cases here
+  if (strncmp(line,"M900",4)==0)
+  {
+    dbg("M900 set time");
+    uint8_t hh = atoi(line+5);
+    uint8_t mm = atoi(line+8);
+    float minDeg = mm*6.0f;                           // minutes
+    float hrDeg  = (hh%12)*30.0f + mm*0.5f;           // hours
+    char buf[64];
+    sprintf(buf,"G0 X%.1f Y%.1f F2000",minDeg,hrDeg);
+    send_gcode("G90");
+    send_gcode(buf);
+    return true;
   }
+  return false;
 }
