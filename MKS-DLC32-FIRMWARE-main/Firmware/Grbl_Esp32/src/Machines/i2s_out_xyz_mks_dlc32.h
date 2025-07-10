@@ -190,4 +190,4 @@
 #define DEFAULT_BEEP_STATUS                 1
 #define DEFAULT_LANGUAGE_STATUS             1       // default simple engliash
 
-#define CUSTOM_CODE_FILENAME    "../Custom/clock_engine.cpp"
+// #define CUSTOM_CODE_FILENAME    "../Custom/clock_engine.cpp"

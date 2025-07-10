@@ -203,10 +203,9 @@ static void reset_variables() {
 
 void run_once() {
     reset_variables();
-    // Start Grbl main loop. Processes program inputs and executes them.
-    // This can exit on a system abort condition, in which case run_once()
-    // is re-executed by an enclosing loop.
     protocol_main_loop();
+
+    //user_routine();
 }
 
 void __attribute__((weak)) machine_init() {}

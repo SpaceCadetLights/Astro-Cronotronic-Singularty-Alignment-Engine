@@ -115,3 +115,4 @@ void motors_to_cartesian(float* cartestian, float* motors, int n_axis);  // weak
 void user_defined_macro(uint8_t index);
 
 void phy_init_reinit(void);
+void __attribute__((weak)) user_routine(void);

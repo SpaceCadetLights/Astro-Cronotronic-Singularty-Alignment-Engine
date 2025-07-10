@@ -108,6 +108,7 @@ bool can_park() {
 */
 void protocol_main_loop() {
 
+
     static bool first_restart = true;
     uint16_t re_cmd[] = {0x18}; // 复位命令
 

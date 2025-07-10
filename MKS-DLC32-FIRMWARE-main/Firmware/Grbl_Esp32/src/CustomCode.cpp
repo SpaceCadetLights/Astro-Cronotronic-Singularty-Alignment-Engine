@@ -3,7 +3,7 @@
 
 #include "Grbl.h"
 
-#define CUSTOM_CODE_FILENAME    "../Custom/clock_engine.cpp"
+// #define CUSTOM_CODE_FILENAME    "../Custom/clock_engine.cpp"
 
 #ifdef CUSTOM_CODE_FILENAME
     #include CUSTOM_CODE_FILENAME
