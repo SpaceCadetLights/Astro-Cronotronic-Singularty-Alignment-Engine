@@ -13,6 +13,9 @@
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include <Arduino.h>
+#include "MotionControl.h"
+
+
 
 //===================================
 // CONFIGURATION AND TIME VARIABLES
@@ -20,6 +23,18 @@
 
 // Movement control flag - set to false to disable all physical movement
 static bool movement_enabled = true;
+
+// Movement speed in degrees per second (1-100 range)
+// Lower values = slower movement
+static float movement_speed = 30.0f;  // 30 degrees per second default
+
+// Movement acceleration in degrees per second^2 (100-1000 range)
+// Lower values = gentler acceleration/deceleration
+static float movement_accel = 300.0f; // Default acceleration
+
+// Movement timeout multiplier - extends wait time for movements
+// Higher values give more time for movements to complete
+static float movement_timeout_factor = 1.5f; // 50% extra time
 
 // Current time (24-hour format)
 static int current_hour = 12;   // 0-23
@@ -132,7 +147,7 @@ static void time_to_angles(int hour, int minute, float &hour_angle, float &minut
     hour_angle = (hour % 12) * 30.0f + minute * 0.5f;
 }
 
-// Move clock hands to specific angles - direct linear movement only
+// Move clock hands to specific angles - direct linear movement with speed control
 static void move_to_angles(float minute_angle, float hour_angle) {
     char cmd[64];
     
@@ -149,6 +164,33 @@ static void move_to_angles(float minute_angle, float hour_angle) {
     while (hour_angle < 0) hour_angle += 360.0f;
     while (hour_angle >= 360) hour_angle -= 360.0f;
     
+    // Get current position to calculate movement distance
+    float current_min_angle = 0.0f;
+    float current_hour_angle = 0.0f;
+    get_current_position(current_min_angle, current_hour_angle);
+    
+    // Calculate movement distances (accounting for wraparound)
+    float min_dist = fabs(minute_angle - current_min_angle);
+    if (min_dist > 180) min_dist = 360 - min_dist;
+    
+    float hour_dist = fabs(hour_angle - current_hour_angle);
+    if (hour_dist > 180) hour_dist = 360 - hour_dist;
+    
+    // Use the larger distance to calculate movement time
+    float max_distance = max(min_dist, hour_dist);
+    
+    // Calculate movement time in milliseconds based on speed
+    uint32_t movement_time_ms = (uint32_t)((max_distance / movement_speed) * 1000);
+    
+    // Add additional time for acceleration/deceleration (simplified calculation)
+    movement_time_ms += (uint32_t)(2000.0f * sqrt(max_distance / movement_accel));
+    
+    // Apply timeout factor for safety
+    movement_time_ms = (uint32_t)(movement_time_ms * movement_timeout_factor);
+    
+    // Ensure minimum movement time
+    if (movement_time_ms < 500) movement_time_ms = 500;
+    
     // Track desired position even when movement is disabled
     target_minute_angle = minute_angle;
     target_hour_angle = hour_angle;
@@ -159,15 +201,34 @@ static void move_to_angles(float minute_angle, float hour_angle) {
         return;
     }
     
+    // Set acceleration
+    memset(cmd, 0, sizeof(cmd));
+    snprintf(cmd, sizeof(cmd)-1, "$120=%.1f", movement_accel);
+    send_gcode(cmd);
+    vTaskDelay(50 / portTICK_PERIOD_MS);
+    
+    snprintf(cmd, sizeof(cmd)-1, "$121=%.1f", movement_accel);
+    send_gcode(cmd);
+    vTaskDelay(50 / portTICK_PERIOD_MS);
+    
     // Move to absolute position
     send_gcode("G90"); // Absolute positioning
-    vTaskDelay(50 / portTICK_PERIOD_MS); // Brief delay
+    vTaskDelay(50 / portTICK_PERIOD_MS);
     
-    // Create command with angles and send it
+    // Calculate feedrate in mm/min from degrees/sec (1mm = 1deg, 60sec = 1min)
+    float feedrate = movement_speed * 60.0f;
+    
+    // Create command with angles and speed and send it
     memset(cmd, 0, sizeof(cmd));
-    snprintf(cmd, sizeof(cmd)-1, "G1 X%.1f Y%.1f F3000", minute_angle, hour_angle);
-    debug_msg("Moving to X%.1f Y%.1f", minute_angle, hour_angle);
+    snprintf(cmd, sizeof(cmd)-1, "G1 X%.1f Y%.1f F%.1f", minute_angle, hour_angle, feedrate);
+    debug_msg("Moving to X%.1f Y%.1f (speed:%.1f deg/s, est. time:%dms)", 
+              minute_angle, hour_angle, movement_speed, movement_time_ms);
     send_gcode(cmd);
+    
+    // Wait for movement to complete
+    debug_msg("Waiting for movement to complete...");
+    vTaskDelay(movement_time_ms / portTICK_PERIOD_MS);
+    debug_msg("Movement should be complete");
 }
 
 // Move clock to display a specific time
@@ -330,32 +391,78 @@ void clockEngineTask(void* parameter) {
             
             system_ready = true;
             debug_msg("System initialized, preparing for homing");
+            
+            // Move hands to show that the system is alive, even before homing
+            debug_msg("Moving hands to show system is active (at reduced speed)");
+            movement_enabled = true; // Force movement on
+            move_to_angles(90, 270); // Move to 3:00/9:00 position (perpendicular)
+            vTaskDelay(2000 / portTICK_PERIOD_MS); // 2 seconds between movements
+            move_to_angles(180, 180); // Move to 6:00 position (aligned)
+            vTaskDelay(2000 / portTICK_PERIOD_MS); // 2 seconds between movements
+            move_to_angles(0, 0); // Return to 12:00 position
+            vTaskDelay(2000 / portTICK_PERIOD_MS); // 2 seconds between movements
+            debug_msg("Initial movement test complete, continuing with homing");
         }
         
         // HOMING: Use a direct approach without state machine
         if (system_ready && !initial_homing_done) {
-            debug_msg("Starting simplified homing approach");
+            debug_msg("Starting sequential homing approach");
             
             // 1. Make absolutely sure we're unlocked
             debug_msg("Unlocking system");
             send_gcode("$X");
-            vTaskDelay(2000 / portTICK_PERIOD_MS);  // Longer delay
+            vTaskDelay(2000 / portTICK_PERIOD_MS);
             
-            // 2. Try using the Serial interface directly
-            debug_msg("Attempting homing via direct serial write");
-            Serial.print("$H\n");  // Send directly to serial port
-            vTaskDelay(5000 / portTICK_PERIOD_MS);  // Much longer delay
+            // 2. First home the HOUR hand (Y axis) independently
+            debug_msg("Homing hour hand (Y axis)");
+            if (sys.state == State::Idle) {
+                // Home Y axis only (bit mask: Y=2)
+                mc_homing_cycle(0x2);  // Home Y axis (hour hand)
+                vTaskDelay(5000 / portTICK_PERIOD_MS); // Extra time to complete
+                debug_msg("Hour hand (Y axis) homing complete");
+            } else {
+                debug_msg("ERROR: Cannot home - system not in idle state");
+            }
             
-            // 3. Move to 0,0 regardless of homing result
-            debug_msg("Moving to 12 o'clock position (0,0)");
+            // 3. Then home the MINUTE hand (X axis) independently
+            debug_msg("Homing minute hand (X axis)");
+            if (sys.state == State::Idle) {
+                // Home X axis only (bit mask: X=1)
+                mc_homing_cycle(0x1);  // Home X axis (minute hand)
+                vTaskDelay(5000 / portTICK_PERIOD_MS); // Extra time to complete
+                debug_msg("Minute hand (X axis) homing complete");
+            } else {
+                debug_msg("ERROR: Cannot home - system not in idle state");
+            }
+            
+            // 4. Move to 0,0 (12 o'clock position) after both axes are homed
+            debug_msg("Homing complete, moving to 12 o'clock position (0,0)");
             move_to_angles(0, 0);
             vTaskDelay(3000 / portTICK_PERIOD_MS);
             
-            // 4. Mark homing as complete
+            // 5. Mark homing as complete
             debug_msg("Marking homing as complete");
             initial_homing_done = true;
             
-            // 5. Start sequence
+            // 6. Now do the test movements AFTER homing is complete
+            debug_msg("Beginning test movements");
+            float saved_speed = movement_speed;
+            movement_speed = 15.0f; // Slower speed for testing
+            
+            move_to_angles(90, 270); // 3:00/9:00 position
+            vTaskDelay(2000 / portTICK_PERIOD_MS);
+            
+            move_to_angles(180, 180); // 6:00 position
+            vTaskDelay(2000 / portTICK_PERIOD_MS);
+            
+            move_to_angles(0, 0); // Back to 12:00 position
+            vTaskDelay(2000 / portTICK_PERIOD_MS);
+            
+            // Restore normal speed
+            movement_speed = saved_speed;
+            debug_msg("Test movements complete");
+            
+            // 7. Start sequence
             sequence_active = true;
             current_sequence_step = 0;
             sequence_step_start_time = millis();
@@ -441,7 +548,8 @@ void clock_set_time(int hour, int minute) {
     current_minute = minute % 60;
     
     // If currently showing real time, update the display
-    if (current_mode == MODE_CURRENT_TIME && system_ready && initial_homing_done) {
+    // Remove the system_ready check to allow movement anytime
+    if (current_mode == MODE_CURRENT_TIME) {
         display_time(current_hour, current_minute);
     }
 }
@@ -485,7 +593,8 @@ void clock_set_target_time(int hour, int minute) {
     target_minute = minute % 60;
     
     // If currently showing specific time, update the display
-    if (current_mode == MODE_SPECIFIC_TIME && system_ready && initial_homing_done) {
+    // Remove the system_ready check
+    if (current_mode == MODE_SPECIFIC_TIME) {
         display_time(target_hour, target_minute);
     }
 }
@@ -496,7 +605,8 @@ void clock_set_angles(float minute_angle, float hour_angle) {
     target_hour_angle = hour_angle;
     
     // If currently in direct angle mode, update the display
-    if (current_mode == MODE_DIRECT_ANGLE && system_ready && initial_homing_done) {
+    // Remove the system_ready check
+    if (current_mode == MODE_DIRECT_ANGLE) {
         move_to_angles(minute_angle, hour_angle);
     }
 }
@@ -542,8 +652,47 @@ void clock_set_movement_enabled(bool enabled) {
     debug_msg("Clock movement %s", enabled ? "enabled" : "disabled");
 }
 
+// Set the movement speed in degrees per second
+void clock_set_movement_speed(float speed_deg_per_sec, float accel_deg_per_sec_sq) {
+    // Validate and bound input values
+    if (speed_deg_per_sec < 1.0f) speed_deg_per_sec = 1.0f;
+    if (speed_deg_per_sec > 100.0f) speed_deg_per_sec = 100.0f;
+    
+    if (accel_deg_per_sec_sq < 100.0f) accel_deg_per_sec_sq = 100.0f;
+    if (accel_deg_per_sec_sq > 1000.0f) accel_deg_per_sec_sq = 1000.0f;
+    
+    movement_speed = speed_deg_per_sec;
+    movement_accel = accel_deg_per_sec_sq;
+    
+    debug_msg("Movement speed set to %.1f deg/s, accel %.1f deg/s²", 
+              movement_speed, movement_accel);
+}
+
+// Set the movement timeout factor
+void clock_set_movement_timeout(float timeout_factor) {
+    if (timeout_factor < 1.0f) timeout_factor = 1.0f;
+    if (timeout_factor > 5.0f) timeout_factor = 5.0f;
+    
+    movement_timeout_factor = timeout_factor;
+    debug_msg("Movement timeout factor set to %.1f", movement_timeout_factor);
+}
+
 // Set up a custom M-code handler for clock control
 bool gcode_unknown_command_execute(char *line) {
+    // Special emergency unlock/enable command
+    if (strncmp(line, "M999", 4) == 0) {
+        debug_msg("Emergency initialization");
+        send_gcode("$X"); // Unlock
+        vTaskDelay(500 / portTICK_PERIOD_MS);
+        send_gcode("$1=255"); // Enable steppers
+        vTaskDelay(500 / portTICK_PERIOD_MS);
+        send_gcode("G21"); // Set mm units
+        vTaskDelay(500 / portTICK_PERIOD_MS);
+        system_ready = true; // Force system ready
+        movement_enabled = true; // Force movement enabled
+        return true;
+    }
+    
     // M900 HH:MM - Set the current time
     if (strncmp(line, "M900", 4) == 0) {
         int hour = atoi(line + 5);
@@ -616,6 +765,32 @@ bool gcode_unknown_command_execute(char *line) {
         int enabled = atoi(line + 5);
         clock_set_movement_enabled(enabled != 0);
         debug_msg("Movement %s", enabled ? "enabled" : "disabled");
+        return true;
+    }
+    
+    // M907 S[speed] A[accel] - Set movement speed and acceleration
+    if (strncmp(line, "M907", 4) == 0) {
+        float speed = movement_speed;
+        float accel = movement_accel;
+        
+        char* s_pos = strstr(line, "S");
+        char* a_pos = strstr(line, "A");
+        
+        if (s_pos) speed = atof(s_pos + 1);
+        if (a_pos) accel = atof(a_pos + 1);
+        
+        clock_set_movement_speed(speed, accel);
+        return true;
+    }
+    
+    // M908 T[factor] - Set movement timeout factor
+    if (strncmp(line, "M908", 4) == 0) {
+        float timeout = movement_timeout_factor;
+        
+        char* t_pos = strstr(line, "T");
+        if (t_pos) timeout = atof(t_pos + 1);
+        
+        clock_set_movement_timeout(timeout);
         return true;
     }
     
