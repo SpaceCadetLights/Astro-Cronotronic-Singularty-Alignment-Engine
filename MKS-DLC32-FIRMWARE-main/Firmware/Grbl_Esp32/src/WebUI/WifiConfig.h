@@ -45,8 +45,8 @@ namespace WebUI {
     static const char* DEFAULT_STA_SSID = CONNECT_TO_SSID;
     static const char* DEFAULT_STA_PWD  = SSID_PASSWORD;
 #else   //!CONNECT_TO_SSID
-    static const char* DEFAULT_STA_SSID = "MKS_DLC";
-    static const char* DEFAULT_STA_PWD  = "12345678";
+    static const char* DEFAULT_STA_SSID = "ASTRO-CRONOTRONIC-CLOCK-1";
+    static const char* DEFAULT_STA_PWD  = "spacecadets";
 #endif  //CONNECT_TO_SSID
     static const char* DEFAULT_STA_IP            = "0.0.0.0";
     static const char* DEFAULT_STA_GW            = "0.0.0.0";

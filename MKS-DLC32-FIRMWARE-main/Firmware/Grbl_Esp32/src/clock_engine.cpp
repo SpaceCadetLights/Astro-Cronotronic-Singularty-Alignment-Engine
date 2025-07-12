@@ -18,6 +18,9 @@
 // CONFIGURATION AND TIME VARIABLES
 //===================================
 
+// Movement control flag - set to false to disable all physical movement
+static bool movement_enabled = true;
+
 // Current time (24-hour format)
 static int current_hour = 12;   // 0-23
 static int current_minute = 0;  // 0-59
@@ -27,11 +30,7 @@ enum ClockMode {
     MODE_CURRENT_TIME = 0,  // Show the current time
     MODE_SPECIFIC_TIME,     // Show a specific time
     MODE_PLAY_FILE,         // Play a G-code file
-    MODE_DIRECT_ANGLE,      // Move to specific angles
-    MODE_SPIRAL_MOTION,     // Spiral movement pattern
-    MODE_PENDULUM_SWING,    // Pendulum swinging motion
-    MODE_BOUNCE_EFFECT,     // Bouncing animation
-    MODE_RANDOM_DANCE       // Random playful movements
+    MODE_DIRECT_ANGLE       // Move to specific angles
 };
 
 // Current operation mode
@@ -50,41 +49,42 @@ static char file_to_play[32] = "spin420.nc";
 
 // Sequence configuration
 typedef struct {
-    ClockMode mode;
-    int hour;
-    int minute;
-    float min_angle;
-    float hour_angle;
-    char filename[32];
+    ClockMode mode;        // Operation mode for this step
+    int hour;              // Hour to display (for MODE_SPECIFIC_TIME)
+    int minute;            // Minute to display (for MODE_SPECIFIC_TIME)
+    float min_angle;       // Minute hand angle (for MODE_DIRECT_ANGLE)
+    float hour_angle;      // Hour hand angle (for MODE_DIRECT_ANGLE)
+    char filename[32];     // File to play (for MODE_PLAY_FILE)
     uint32_t duration_ms;  // How long to stay in this mode
-    int animation_style;   // 0=spiral, 1=pendulum, 2=bounce, 3=random, -1=none
 } SequenceStep;
 
+// Define the sequence steps
 #define MAX_SEQUENCE_STEPS 10
 static SequenceStep sequence[MAX_SEQUENCE_STEPS] = {
-    // Time travel sequence
-    {MODE_SPECIFIC_TIME, 12, 0, 0, 0, "", 5000, 0},             // Noon - Spiral animation
-    {MODE_SPECIFIC_TIME, 4, 20, 0, 0, "", 5000, 2},             // 4:20 - Bounce animation
-    {MODE_SPECIFIC_TIME, 7, 7, 0, 0, "", 5000, 1},              // 7:07 - Pendulum animation
+    // Time sequence
+    {MODE_SPECIFIC_TIME, 12, 0, 0, 0, "", 5000},             // Noon
+    {MODE_SPECIFIC_TIME, 4, 20, 0, 0, "", 5000},             // 4:20
+    {MODE_SPECIFIC_TIME, 7, 7, 0, 0, "", 5000},              // 7:07
     
     // Cosmic alignment (using direct angles)
-    {MODE_DIRECT_ANGLE, 0, 0, 180, 180, "", 5000, 3},           // Hands aligned at 6:00 - Random dance
-    {MODE_DIRECT_ANGLE, 0, 0, 90, 270, "", 5000, 1},            // Perpendicular hands (3:00/9:00) - Pendulum
+    {MODE_DIRECT_ANGLE, 0, 0, 180, 180, "", 5000},           // Hands aligned at 6:00
+    {MODE_DIRECT_ANGLE, 0, 0, 90, 270, "", 5000},            // Perpendicular hands (3:00/9:00)
     
     // Playful patterns
-    {MODE_PLAY_FILE, 0, 0, 0, 0, "spin420.nc", 0, -1},          // Play G-code file
+    {MODE_PLAY_FILE, 0, 0, 0, 0, "spin420.nc", 0},           // Play G-code file
     
     // Mystical times
-    {MODE_SPECIFIC_TIME, 11, 11, 0, 0, "", 5000, 2},            // 11:11 - Bounce animation
-    {MODE_SPECIFIC_TIME, 12, 34, 0, 0, "", 5000, 1},            // 12:34 - Pendulum animation
+    {MODE_SPECIFIC_TIME, 11, 11, 0, 0, "", 5000},            // 11:11
+    {MODE_SPECIFIC_TIME, 12, 34, 0, 0, "", 5000},            // 12:34
     
     // Kaleidoscope effect
-    {MODE_DIRECT_ANGLE, 0, 0, 45, 315, "", 5000, 3},            // 1:30/10:30 - Random dance
+    {MODE_DIRECT_ANGLE, 0, 0, 45, 315, "", 5000},            // 1:30/10:30
     
     // Return to current time
-    {MODE_CURRENT_TIME, 0, 0, 0, 0, "", 15000, 0}               // Current time - Spiral animation
+    {MODE_CURRENT_TIME, 0, 0, 0, 0, "", 15000}               // Current time
 };
 
+// Sequence tracking variables
 static int current_sequence_step = 0;
 static uint32_t sequence_step_start_time = 0;
 static bool sequence_active = true;
@@ -98,24 +98,23 @@ static bool file_playback_active = false;
 // UTILITY FUNCTIONS
 //===================================
 
-// Forward declarations for animation functions
-static void spiral_movement(float end_x, float end_y, int revolutions);
-static void pendulum_swing(float end_x, float end_y, int swings);
-static void bounce_effect(float end_x, float end_y, int bounces);
-static void random_dance(float end_x, float end_y, int dance_moves);
-static void animated_move_to_angles(float minute_angle, float hour_angle, int animation_style);
+// Forward declaration of the position function
 static void get_current_position(float &x, float &y);
 
 // Function to send G-code commands
 static bool send_gcode(const char *line) {
+    // Copy the line to a temporary buffer for safety
     static char buf[96];
     strncpy(buf, line, sizeof(buf)-1);
     buf[sizeof(buf)-1] = '\0';
+    
+    // Execute the G-code command
     return (gc_execute_line(buf, CLIENT_SERIAL) == Error::Ok);
 }
 
 // Debug message function
 static void debug_msg(const char *format, ...) {
+    // Format and send debug messages to the serial console
     char buffer[128];
     va_list args;
     va_start(args, format);
@@ -133,35 +132,53 @@ static void time_to_angles(int hour, int minute, float &hour_angle, float &minut
     hour_angle = (hour % 12) * 30.0f + minute * 0.5f;
 }
 
-// Move clock hands to specific angles
-static void move_to_angles(float minute_angle, float hour_angle, bool use_animation = true) {
-    // If animation is disabled or we need precise positioning, use direct movement
-    if (!use_animation) {
-        char cmd[64];
-        // Move to absolute position
-        send_gcode("G90");
-        // Create command with angles
-        sprintf(cmd, "G0 X%.1f Y%.1f F3000", minute_angle, hour_angle);
-        // Send the move command
-        debug_msg("Direct move to X%.1f Y%.1f", minute_angle, hour_angle);
-        send_gcode(cmd);
+// Move clock hands to specific angles - direct linear movement only
+static void move_to_angles(float minute_angle, float hour_angle) {
+    char cmd[64];
+    
+    // Validate input angles
+    if (isnan(minute_angle) || isnan(hour_angle) ||
+        isinf(minute_angle) || isinf(hour_angle)) {
+        debug_msg("WARNING: Invalid angle inputs to move_to_angles");
         return;
     }
     
-    // Use animated movement with random animation style
-    animated_move_to_angles(minute_angle, hour_angle, -1); // -1 means random style
+    // Bound angles to reasonable ranges (0-360)
+    while (minute_angle < 0) minute_angle += 360.0f;
+    while (minute_angle >= 360) minute_angle -= 360.0f;
+    while (hour_angle < 0) hour_angle += 360.0f;
+    while (hour_angle >= 360) hour_angle -= 360.0f;
+    
+    // Track desired position even when movement is disabled
+    target_minute_angle = minute_angle;
+    target_hour_angle = hour_angle;
+    
+    // Skip physical movement if disabled
+    if (!movement_enabled) {
+        debug_msg("Movement disabled - virtual position X%.1f Y%.1f", minute_angle, hour_angle);
+        return;
+    }
+    
+    // Move to absolute position
+    send_gcode("G90"); // Absolute positioning
+    vTaskDelay(50 / portTICK_PERIOD_MS); // Brief delay
+    
+    // Create command with angles and send it
+    memset(cmd, 0, sizeof(cmd));
+    snprintf(cmd, sizeof(cmd)-1, "G1 X%.1f Y%.1f F3000", minute_angle, hour_angle);
+    debug_msg("Moving to X%.1f Y%.1f", minute_angle, hour_angle);
+    send_gcode(cmd);
 }
 
 // Move clock to display a specific time
-static void display_time(int hour, int minute, int animation_style = -1) {
+static void display_time(int hour, int minute) {
     float hour_angle, minute_angle;
+    
+    // Convert the time to angles
     time_to_angles(hour, minute, hour_angle, minute_angle);
     
-    if (animation_style >= 0) {
-        animated_move_to_angles(minute_angle, hour_angle, animation_style);
-    } else {
-        move_to_angles(minute_angle, hour_angle, true); // Use random animation
-    }
+    // Move to the calculated angles
+    move_to_angles(minute_angle, hour_angle);
 }
 
 // Start playback of a G-code file
@@ -177,6 +194,7 @@ static void play_gcode_file(const char* filename) {
 
 // Move to the next step in the sequence
 static void advance_sequence() {
+    // Move to the next step, wrapping around if needed
     current_sequence_step = (current_sequence_step + 1) % MAX_SEQUENCE_STEPS;
     sequence_step_start_time = millis();
     
@@ -190,17 +208,18 @@ static void advance_sequence() {
     // Apply the new mode
     current_mode = sequence[current_sequence_step].mode;
     
+    // Execute the appropriate action based on the mode
     switch (current_mode) {
         case MODE_CURRENT_TIME:
             debug_msg("Sequence: Showing current time");
+            display_time(current_hour, current_minute);
             break;
             
         case MODE_SPECIFIC_TIME:
             target_hour = sequence[current_sequence_step].hour;
             target_minute = sequence[current_sequence_step].minute;
-            debug_msg("Sequence: Showing specific time %02d:%02d (animation %d)", 
-                      target_hour, target_minute, sequence[current_sequence_step].animation_style);
-            display_time(target_hour, target_minute, sequence[current_sequence_step].animation_style);
+            debug_msg("Sequence: Showing specific time %02d:%02d", target_hour, target_minute);
+            display_time(target_hour, target_minute);
             break;
             
         case MODE_PLAY_FILE:
@@ -213,355 +232,9 @@ static void advance_sequence() {
         case MODE_DIRECT_ANGLE:
             target_minute_angle = sequence[current_sequence_step].min_angle;
             target_hour_angle = sequence[current_sequence_step].hour_angle;
-            debug_msg("Sequence: Moving to angles X%.1f Y%.1f (animation %d)", 
-                      target_minute_angle, target_hour_angle, sequence[current_sequence_step].animation_style);
-            animated_move_to_angles(target_minute_angle, target_hour_angle, 
-                                  sequence[current_sequence_step].animation_style);
-            break;
-    }
-}
-
-//===================================
-// ANIMATION FUNCTIONS
-//===================================
-
-// Create a spiral movement pattern - SAFER VERSION
-static void spiral_movement(float end_x, float end_y, int revolutions = 2) {
-    float start_x = 0;
-    float start_y = 0;
-    
-    // Get current position safely
-    get_current_position(start_x, start_y);
-    
-    debug_msg("Starting spiral movement to X%.1f Y%.1f", end_x, end_y);
-    
-    // Use G-code arcs to create spiral effect
-    send_gcode("G90"); // Absolute positioning
-    vTaskDelay(50 / portTICK_PERIOD_MS); // Add delay after each command
-    
-    // Calculate center point for the spiral
-    float center_x = (start_x + end_x) / 2;
-    float center_y = (start_y + end_y) / 2;
-    
-    // Create multiple arc movements that gradually get closer to the target
-    float dx = end_x - center_x;
-    float dy = end_y - center_y;
-    float radius = sqrtf(dx*dx + dy*dy);
-    
-    // Safety check - ensure radius is valid
-    if (isnan(radius) || radius < 0.1f) {
-        radius = 10.0f; // Fallback to a safe default
-    }
-    
-    // Number of segments in our spiral - limit to reasonable range
-    int segments = 12 * revolutions;
-    if (segments > 50) segments = 50; // Limit max segments
-    if (segments < 5) segments = 5;   // Ensure minimum segments
-    
-    // Move to starting point first for safety
-    char cmd[64];
-    memset(cmd, 0, sizeof(cmd)); // Clear buffer
-    snprintf(cmd, sizeof(cmd)-1, "G1 X%.1f Y%.1f F2000", start_x, start_y);
-    send_gcode(cmd);
-    vTaskDelay(100 / portTICK_PERIOD_MS); // Longer delay at start
-    
-    // Generate spiral points
-    for (int i = 0; i < segments; i++) {
-        float ratio = (float)(i+1) / segments;
-        if (ratio > 1.0f) ratio = 1.0f; // Safety bounds
-        
-        float angle = ratio * 2 * M_PI * revolutions;
-        
-        // Gradually decrease the radius to create spiral
-        float current_radius = radius * (1.0f - 0.8f * ratio);
-        
-        // Calculate position on the spiral
-        float x = center_x + current_radius * cosf(angle);
-        float y = center_y + current_radius * sinf(angle);
-        
-        // Get closer to final destination with each iteration
-        x = x * (1.0f - ratio) + end_x * ratio;
-        y = y * (1.0f - ratio) + end_y * ratio;
-        
-        // Check for invalid values
-        if (isnan(x) || isnan(y) || isinf(x) || isinf(y)) {
-            debug_msg("Invalid spiral point calculated, skipping");
-            continue;
-        }
-        
-        // Create movement command with safety buffer clearing
-        memset(cmd, 0, sizeof(cmd));
-        snprintf(cmd, sizeof(cmd)-1, "G1 X%.1f Y%.1f F2000", x, y);
-        send_gcode(cmd);
-        
-        // Longer delay to prevent command buffer overflow
-        vTaskDelay(70 / portTICK_PERIOD_MS);
-    }
-    
-    // Final precise positioning with extra safety
-    vTaskDelay(200 / portTICK_PERIOD_MS); // Wait longer before final position
-    memset(cmd, 0, sizeof(cmd));
-    snprintf(cmd, sizeof(cmd)-1, "G1 X%.1f Y%.1f F1000", end_x, end_y);
-    send_gcode(cmd);
-    vTaskDelay(100 / portTICK_PERIOD_MS); // Wait after final move
-}
-
-// Create a pendulum swinging effect
-static void pendulum_swing(float end_x, float end_y, int swings = 3) {
-    float start_x = 0;
-    float start_y = 0;
-    
-    // Get current position
-    get_current_position(start_x, start_y);
-    
-    debug_msg("Starting pendulum swing to X%.1f Y%.1f", end_x, end_y);
-    
-    // Use G-code arcs to create pendulum effect
-    send_gcode("G90"); // Absolute positioning
-    
-    // Calculate distance
-    float dx = end_x - start_x;
-    float dy = end_y - start_y;
-    float distance = sqrtf(dx*dx + dy*dy);
-    
-    // Calculate angle between start and end points
-    float angle = atan2f(dy, dx);
-    
-    // Pendulum effect: oscillate with decreasing amplitude
-    for (int i = 0; i < swings * 2; i++) {
-        float completion = (float)(i+1) / (swings * 2);
-        float amplitude = (1.0f - completion) * 0.5f; // Decreasing amplitude
-        
-        // Oscillation pattern
-        float swing_factor = sinf(M_PI * (i+1));
-        
-        // Calculate position perpendicular to the direct path
-        float perpendicular_angle = angle + M_PI/2;
-        float offset_x = amplitude * distance * cosf(perpendicular_angle) * swing_factor;
-        float offset_y = amplitude * distance * sinf(perpendicular_angle) * swing_factor;
-        
-        // Calculate position along the path
-        float path_ratio = powf(completion, 0.7); // Non-linear progression
-        float path_x = start_x + dx * path_ratio;
-        float path_y = start_y + dy * path_ratio;
-        
-        // Apply perpendicular offset
-        float x = path_x + offset_x;
-        float y = path_y + offset_y;
-        
-        // Create movement command
-        char cmd[64];
-        sprintf(cmd, "G1 X%.1f Y%.1f F2000", x, y);
-        send_gcode(cmd);
-        vTaskDelay(100 / portTICK_PERIOD_MS);
-    }
-    
-    // Final precise positioning
-    char cmd[64];
-    sprintf(cmd, "G1 X%.1f Y%.1f F1000", end_x, end_y);
-    send_gcode(cmd);
-}
-
-// Create a bouncing effect animation - SAFER VERSION
-static void bounce_effect(float end_x, float end_y, int bounces = 3) {
-    float start_x = 0;
-    float start_y = 0;
-    
-    // Get current position safely
-    get_current_position(start_x, start_y);
-    
-    debug_msg("Starting bounce effect to X%.1f Y%.1f", end_x, end_y);
-    
-    send_gcode("G90"); // Absolute positioning
-    
-    // Calculate direct line segments
-    float dx = end_x - start_x;
-    float dy = end_y - start_y;
-    
-    // Limit bounce count to prevent issues
-    if (bounces > 5) bounces = 5;
-    if (bounces < 1) bounces = 1;
-    
-    // Generate a series of "bounces" along the path - fewer segments to reduce computation
-    int segments = 15;
-    
-    // Do direct movement for first 20% of the path
-    char cmd[64];
-    sprintf(cmd, "G1 X%.1f Y%.1f F2000", 
-            start_x + dx * 0.2f, 
-            start_y + dy * 0.2f);
-    send_gcode(cmd);
-    vTaskDelay(100 / portTICK_PERIOD_MS);
-    
-    // Now do bounces for the remaining 80%
-    for (int i = 3; i < segments; i++) {
-        // Safe calculation of t from 0.2 to 1.0
-        float t = 0.2f + (float)(i-3) / (float)(segments-3) * 0.8f;
-        
-        // Position along direct path
-        float x = start_x + t * dx;
-        float y = start_y + t * dy;
-        
-        // Add bouncing effect - a series of dampened bounces
-        float bounce = 0;
-        for (int j = 0; j < bounces; j++) {
-            // Safe calculations with bounded values
-            float decay = j == 0 ? 1.0f : 0.5f * decay; // Simpler decay calculation
-            float frequency = 8.0f + j * 4.0f; // Linear frequency increase, safer than exponential
-            float wave = sinf(t * frequency * M_PI);
-            
-            // Bound wave value to prevent extreme values
-            if (wave > 1.0f) wave = 1.0f;
-            if (wave < -1.0f) wave = -1.0f;
-            
-            bounce += decay * wave;
-        }
-        
-        // Limit bounce magnitude to prevent extreme values
-        if (bounce > 1.0f) bounce = 1.0f;
-        if (bounce < -1.0f) bounce = -1.0f;
-        
-        // Apply bounce perpendicular to movement direction
-        float path_angle = atan2f(dy, dx);
-        float perpendicular_angle = path_angle + M_PI/2;
-        
-        // Scale bounce more conservatively
-        float distance = sqrtf(dx*dx + dy*dy);
-        float scale = distance * 0.05f; // Reduced from 0.08f to 0.05f
-        
-        // Apply bounce effect
-        x += scale * bounce * cosf(perpendicular_angle);
-        y += scale * bounce * sinf(perpendicular_angle);
-        
-        // Create movement command with bounds checking
-        if (isnan(x) || isnan(y)) {
-            // If we somehow got a NaN, skip this point
-            continue;
-        }
-        
-        // Format command with error checking
-        memset(cmd, 0, sizeof(cmd)); // Clear buffer first
-        snprintf(cmd, sizeof(cmd)-1, "G1 X%.1f Y%.1f F2000", x, y);
-        send_gcode(cmd);
-        vTaskDelay(70 / portTICK_PERIOD_MS);
-    }
-    
-    // Final precise positioning with extra safety delay
-    vTaskDelay(200 / portTICK_PERIOD_MS);
-    memset(cmd, 0, sizeof(cmd));
-    snprintf(cmd, sizeof(cmd)-1, "G1 X%.1f Y%.1f F1000", end_x, end_y);
-    send_gcode(cmd);
-}
-
-// Create random playful movements before reaching the target
-static void random_dance(float end_x, float end_y, int dance_moves = 5) {
-    float start_x = 0;
-    float start_y = 0;
-    
-    // Get current position
-    get_current_position(start_x, start_y);
-    
-    debug_msg("Starting random dance to X%.1f Y%.1f", end_x, end_y);
-    
-    send_gcode("G90"); // Absolute positioning
-    
-    // Calculate the midpoint between start and end
-    float mid_x = (start_x + end_x) / 2;
-    float mid_y = (start_y + end_y) / 2;
-    
-    // Calculate distance for scaling random movements
-    float dx = end_x - start_x;
-    float dy = end_y - start_y;
-    float distance = sqrtf(dx*dx + dy*dy);
-    float random_range = distance * 0.3f; // 30% of distance
-    
-    // Generate random waypoints that eventually lead to the target
-    for (int i = 0; i < dance_moves; i++) {
-        float completion = (float)(i+1) / (dance_moves + 1);
-        
-        // Generate a random offset that gets smaller as we approach the target
-        float random_scale = (1.0f - powf(completion, 2)) * random_range;
-        
-        // Random offsets
-        float offset_x = ((float)rand() / RAND_MAX * 2 - 1) * random_scale;
-        float offset_y = ((float)rand() / RAND_MAX * 2 - 1) * random_scale;
-        
-        // Position along direct path with increasing bias toward destination
-        float path_x = start_x + dx * completion;
-        float path_y = start_y + dy * completion;
-        
-        // Apply random offset
-        float x = path_x + offset_x;
-        float y = path_y + offset_y;
-        
-        // Create movement command with varying speed for playfulness
-        float speed = 1000 + (float)rand() / RAND_MAX * 2000;
-        char cmd[64];
-        sprintf(cmd, "G1 X%.1f Y%.1f F%.0f", x, y, speed);
-        send_gcode(cmd);
-        
-        // Random delays between moves
-        int delay = 50 + rand() % 150;
-        vTaskDelay(delay / portTICK_PERIOD_MS);
-    }
-    
-    // Final precise positioning
-    char cmd[64];
-    sprintf(cmd, "G1 X%.1f Y%.1f F1000", end_x, end_y);
-    send_gcode(cmd);
-}
-
-// Unified animated movement function that selects an animation style
-static void animated_move_to_angles(float minute_angle, float hour_angle, int animation_style = -1) {
-    // Validate input angles
-    if (isnan(minute_angle) || isnan(hour_angle) ||
-        isinf(minute_angle) || isinf(hour_angle)) {
-        debug_msg("WARNING: Invalid angle inputs to animated_move_to_angles");
-        return;
-    }
-    
-    // Bound angles to reasonable ranges (0-360)
-    while (minute_angle < 0) minute_angle += 360.0f;
-    while (minute_angle >= 360) minute_angle -= 360.0f;
-    while (hour_angle < 0) hour_angle += 360.0f;
-    while (hour_angle >= 360) hour_angle -= 360.0f;
-    
-    // Select a random animation if not specified, or fallback on direct if needed
-    if (animation_style < 0 || animation_style > 3) {
-        animation_style = rand() % 4;
-    }
-    
-    // If the angles are extreme, use direct movement for safety
-    float angle_diff = fabsf(minute_angle - hour_angle);
-    if (angle_diff > 180) {
-        debug_msg("Large angle difference detected, using direct movement for safety");
-        animation_style = -1;
-    }
-    
-    debug_msg("Animated move to X%.1f Y%.1f (style %d)", minute_angle, hour_angle, animation_style);
-    
-    // Apply the selected animation with safety
-    switch (animation_style) {
-        case 0:
-            spiral_movement(minute_angle, hour_angle, 2);
-            break;
-        case 1:
-            pendulum_swing(minute_angle, hour_angle, 3);
-            break;
-        case 2:
-            bounce_effect(minute_angle, hour_angle, 3);
-            break;
-        case 3:
-            random_dance(minute_angle, hour_angle, 5);
-            break;
-        default:
-            // Fallback to direct movement
-            char cmd[64];
-            memset(cmd, 0, sizeof(cmd));
-            send_gcode("G90");
-            vTaskDelay(50 / portTICK_PERIOD_MS);
-            snprintf(cmd, sizeof(cmd)-1, "G1 X%.1f Y%.1f F1500", minute_angle, hour_angle);
-            send_gcode(cmd);
+            debug_msg("Sequence: Moving to angles X%.1f Y%.1f", 
+                      target_minute_angle, target_hour_angle);
+            move_to_angles(target_minute_angle, target_hour_angle);
             break;
     }
 }
@@ -572,7 +245,7 @@ static void animated_move_to_angles(float minute_angle, float hour_angle, int an
 
 // This function will be called from the main .ino file
 void clockEngineTask(void* parameter) {
-    // Wait longer for system to boot fully - increased from 5 to 20 seconds
+    // Wait for system to boot fully
     debug_msg("Clock engine starting, waiting 20 seconds for system to initialize...");
     vTaskDelay(20000 / portTICK_PERIOD_MS);
     
@@ -587,9 +260,9 @@ void clockEngineTask(void* parameter) {
     
     // Task loop
     while(true) {
-        // Safety watchdog
+        // Safety watchdog to recover from stalled states
         static uint32_t last_watchdog_kick = 0;
-        uint32_t now = millis();  // DECLARE now ONLY ONCE
+        uint32_t now = millis();
         
         if (now - last_watchdog_kick > 30000) { // Every 30 seconds
             // Reset any stalled states
@@ -841,8 +514,7 @@ void clock_play_file(const char* filename) {
 // Update a specific sequence step
 void clock_set_sequence_step(int step_index, int mode, int hour, int minute, 
                            float min_angle, float hour_angle, 
-                           const char* filename, uint32_t duration_ms,
-                           int animation_style = -1) {
+                           const char* filename, uint32_t duration_ms) {
     if (step_index >= 0 && step_index < MAX_SEQUENCE_STEPS) {
         sequence[step_index].mode = static_cast<ClockMode>(mode);
         sequence[step_index].hour = hour;
@@ -852,7 +524,6 @@ void clock_set_sequence_step(int step_index, int mode, int hour, int minute,
         strncpy(sequence[step_index].filename, filename, sizeof(sequence[step_index].filename)-1);
         sequence[step_index].filename[sizeof(sequence[step_index].filename)-1] = '\0';
         sequence[step_index].duration_ms = duration_ms;
-        sequence[step_index].animation_style = animation_style;
     }
 }
 
@@ -863,6 +534,12 @@ void clock_jump_to_sequence_step(int step_index) {
         sequence_step_start_time = millis();
         advance_sequence(); // This will apply the settings from the new step
     }
+}
+
+// Set the movement enabled/disabled
+void clock_set_movement_enabled(bool enabled) {
+    movement_enabled = enabled;
+    debug_msg("Clock movement %s", enabled ? "enabled" : "disabled");
 }
 
 // Set up a custom M-code handler for clock control
@@ -934,22 +611,15 @@ bool gcode_unknown_command_execute(char *line) {
         return true;
     }
     
+    // M906 [0/1] - Disable/enable movement
+    if (strncmp(line, "M906", 4) == 0) {
+        int enabled = atoi(line + 5);
+        clock_set_movement_enabled(enabled != 0);
+        debug_msg("Movement %s", enabled ? "enabled" : "disabled");
+        return true;
+    }
+    
     return false;
-}
-
-// Implementation of MKS_GRBL_CMD_SEND function
-void MKS_GRBL_CMD_SEND(const char* cmd) {
-    // Just use our existing send_gcode function which is working
-    char buffer[128];
-    strncpy(buffer, cmd, sizeof(buffer)-1);
-    buffer[sizeof(buffer)-1] = '\0';
-    
-    // Remove any newlines for gc_execute_line
-    char* newline = strchr(buffer, '\n');
-    if (newline) *newline = '\0';
-    
-    // Use our standard method
-    send_gcode(buffer);
 }
 
 // Helper function to get current position
