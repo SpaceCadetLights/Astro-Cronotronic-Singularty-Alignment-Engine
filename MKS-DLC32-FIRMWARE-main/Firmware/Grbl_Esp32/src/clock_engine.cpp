@@ -14,12 +14,21 @@
 #include "freertos/task.h"
 #include <Arduino.h>
 #include "MotionControl.h"
-
-
+#include <Wire.h>
+#include <RTClib.h>
 
 //===================================
 // CONFIGURATION AND TIME VARIABLES
 //===================================
+
+// Forward declaration for debug_msg function so it can be used in the RTC functions
+static void debug_msg(const char *format, ...);
+
+// Forward declaration for send_gcode function so it can be used in the RTC functions
+static bool send_gcode(const char *line);
+
+// Forward declaration for disable_homing_required function
+static void disable_homing_required();
 
 // Movement control flag - set to false to disable all physical movement
 static bool movement_enabled = true;
@@ -110,6 +119,105 @@ static bool initial_homing_done = false;
 static bool file_playback_active = false;
 
 //===================================
+// RTC CONFIGURATION
+//===================================
+
+// I2C pins for the MKS DLC32 board - these are the standard ESP32 I2C pins
+#define SDA_PIN 0
+#define SCL_PIN 4
+
+// RTC object
+RTC_DS1307 rtc;
+static bool rtc_initialized = false;
+
+// Initialize the RTC
+static bool init_rtc() {
+    debug_msg("Initializing DS1307 RTC...");
+    
+    // Save current stepper enable state
+    bool steppers_were_enabled = (sys.state != State::Alarm);
+    
+    // Configure I2C pins - use lower speed to reduce EMI/power issues
+    Wire.begin(SDA_PIN, SCL_PIN);
+    Wire.setClock(100000); // Use 100kHz instead of default 400kHz
+    
+    bool rtc_ok = false;
+    
+    // Try to initialize the RTC with timeout
+    uint32_t start_time = millis();
+    while ((millis() - start_time) < 2000) { // 2 second timeout
+        if (rtc.begin()) {
+            rtc_ok = true;
+            break;
+        }
+        vTaskDelay(100 / portTICK_PERIOD_MS);
+    }
+    
+    if (!rtc_ok) {
+        debug_msg("ERROR: Couldn't find RTC, check wiring!");
+        
+        // Re-enable steppers if they were enabled before
+        if (steppers_were_enabled) {
+            debug_msg("Re-enabling steppers after RTC failure");
+            send_gcode("$1=255");
+            vTaskDelay(100 / portTICK_PERIOD_MS);
+        }
+        
+        return false;
+    }
+    
+    // Check if the RTC is running
+    if (!rtc.isrunning()) {
+        debug_msg("WARNING: RTC is NOT running! Setting to compile time");
+        // Set RTC to compile time when it's not running
+        rtc.adjust(DateTime(F(__DATE__), F(__TIME__)));
+    } else {
+        DateTime now = rtc.now();
+        debug_msg("RTC found and running. Current time: %04d-%02d-%02d %02d:%02d:%02d",
+                 now.year(), now.month(), now.day(),
+                 now.hour(), now.minute(), now.second());
+    }
+    
+    // Re-enable steppers after RTC initialization
+    if (steppers_were_enabled) {
+        debug_msg("Re-enabling steppers after RTC initialization");
+        send_gcode("$1=255");
+        vTaskDelay(100 / portTICK_PERIOD_MS);
+    }
+    
+    return true;
+}
+
+// Get time from RTC and update current_hour and current_minute
+static void update_time_from_rtc() {
+    if (!rtc_initialized) return;
+    
+    DateTime now = rtc.now();
+    
+    // Only update if the time has changed
+    if (current_hour != now.hour() || current_minute != now.minute()) {
+        current_hour = now.hour();
+        current_minute = now.minute();
+        debug_msg("Time updated from RTC: %02d:%02d", current_hour, current_minute);
+    }
+}
+
+// Set the RTC time
+static void set_rtc_time(int hour, int minute) {
+    if (!rtc_initialized) return;
+    
+    // Get current date from RTC
+    DateTime now = rtc.now();
+    
+    // Create a new DateTime object with the updated time
+    DateTime newTime(now.year(), now.month(), now.day(), hour, minute, 0);
+    
+    // Set the RTC
+    rtc.adjust(newTime);
+    debug_msg("RTC time set to %02d:%02d", hour, minute);
+}
+
+//===================================
 // UTILITY FUNCTIONS
 //===================================
 
@@ -188,8 +296,9 @@ static void move_to_angles(float minute_angle, float hour_angle) {
     // Apply timeout factor for safety
     movement_time_ms = (uint32_t)(movement_time_ms * movement_timeout_factor);
     
-    // Ensure minimum movement time
+    // Ensure minimum movement time and cap maximum to avoid WiFi problems
     if (movement_time_ms < 500) movement_time_ms = 500;
+    if (movement_time_ms > 8000) movement_time_ms = 8000; // Cap at 8 seconds
     
     // Track desired position even when movement is disabled
     target_minute_angle = minute_angle;
@@ -225,9 +334,32 @@ static void move_to_angles(float minute_angle, float hour_angle) {
               minute_angle, hour_angle, movement_speed, movement_time_ms);
     send_gcode(cmd);
     
-    // Wait for movement to complete
+    // CRITICAL CHANGE: Don't block WiFi stack with a long delay
+    // Wait for movement to complete in small chunks
     debug_msg("Waiting for movement to complete...");
-    vTaskDelay(movement_time_ms / portTICK_PERIOD_MS);
+    
+    // Use multiple short delays instead of one long one
+    const uint32_t CHECK_INTERVAL = 100; // Check every 100ms
+    uint32_t elapsed = 0;
+    
+    while (elapsed < movement_time_ms) {
+        // Short delay that won't block WiFi
+        vTaskDelay(CHECK_INTERVAL / portTICK_PERIOD_MS);
+        elapsed += CHECK_INTERVAL;
+        
+        // Check if we're done early
+        if (sys.state == State::Idle) {
+            debug_msg("Movement completed early");
+            break;
+        }
+        
+        // Yield more frequently to WiFi
+        if (elapsed % 500 == 0) {
+            // Give extra time for WiFi processing
+            vTaskDelay(5 / portTICK_PERIOD_MS);
+        }
+    }
+    
     debug_msg("Movement should be complete");
 }
 
@@ -390,7 +522,23 @@ void clockEngineTask(void* parameter) {
             vTaskDelay(1000 / portTICK_PERIOD_MS);
             
             system_ready = true;
-            debug_msg("System initialized, preparing for homing");
+            debug_msg("System initialized, initializing RTC");
+            
+            // Initialize RTC - but be prepared to handle failure
+            rtc_initialized = init_rtc();
+            if (!rtc_initialized) {
+                debug_msg("Continuing without RTC - will use software time");
+            }
+            
+            // Make absolutely sure steppers are enabled
+            debug_msg("Ensuring steppers are enabled");
+            send_gcode("$1=255");
+            vTaskDelay(500 / portTICK_PERIOD_MS);
+            
+            // Call the homing required disable function
+            disable_homing_required();
+
+            debug_msg("Preparing for homing");
             
             // Move hands to show that the system is alive, even before homing
             debug_msg("Moving hands to show system is active (at reduced speed)");
@@ -509,17 +657,12 @@ void clockEngineTask(void* parameter) {
             }
         }
         
-        // TIME UPDATE: Simple time increment every minute
-        // In a real implementation, you'd use a proper RTC
-        static uint32_t last_minute_update = 0;
-        if (now - last_minute_update >= 60000) { // Every 60 seconds
-            current_minute++;
-            if (current_minute >= 60) {
-                current_minute = 0;
-                current_hour = (current_hour + 1) % 24;
-            }
-            last_minute_update = now;
-            debug_msg("Time updated: %02d:%02d", current_hour, current_minute);
+        // TIME UPDATE: Get time from RTC instead of software counter
+        static uint32_t last_rtc_check = 0;
+        if (now - last_rtc_check >= 1000) // Check RTC every second
+        {
+            update_time_from_rtc();
+            last_rtc_check = now;
         }
         
         // FILE PLAYBACK CHECK: Check if file playback is complete
@@ -547,8 +690,12 @@ void clock_set_time(int hour, int minute) {
     current_hour = hour % 24;
     current_minute = minute % 60;
     
+    // Update the RTC
+    if (rtc_initialized) {
+        set_rtc_time(current_hour, current_minute);
+    }
+    
     // If currently showing real time, update the display
-    // Remove the system_ready check to allow movement anytime
     if (current_mode == MODE_CURRENT_TIME) {
         display_time(current_hour, current_minute);
     }
@@ -677,8 +824,14 @@ void clock_set_movement_timeout(float timeout_factor) {
     debug_msg("Movement timeout factor set to %.1f", movement_timeout_factor);
 }
 
-// Set up a custom M-code handler for clock control
+// Add this near the top of your file, after the includes:
+bool is_user_input_a_cmd = false;
+
+// Then replace your current gcode_unknown_command_execute function with this version:
 bool gcode_unknown_command_execute(char *line) {
+    // Mark this as a custom command to bypass error checks
+    is_user_input_a_cmd = true;
+    
     // Special emergency unlock/enable command
     if (strncmp(line, "M999", 4) == 0) {
         debug_msg("Emergency initialization");
@@ -690,6 +843,7 @@ bool gcode_unknown_command_execute(char *line) {
         vTaskDelay(500 / portTICK_PERIOD_MS);
         system_ready = true; // Force system ready
         movement_enabled = true; // Force movement enabled
+        is_user_input_a_cmd = false;
         return true;
     }
     
@@ -794,7 +948,40 @@ bool gcode_unknown_command_execute(char *line) {
         return true;
     }
     
+    // M909 - Report RTC status
+    if (strncmp(line, "M909", 4) == 0) {
+        if (!rtc_initialized) {
+            debug_msg("RTC not initialized");
+        } else {
+            DateTime now = rtc.now();
+            debug_msg("RTC time: %04d-%02d-%02d %02d:%02d:%02d",
+                     now.year(), now.month(), now.day(),
+                     now.hour(), now.minute(), now.second());
+            
+            // Check temperature if available (DS3231 only)
+            // Note: DS1307 doesn't have temperature sensing
+            debug_msg("RTC initialized and running");
+        }
+        return true;
+    }
+    
+    is_user_input_a_cmd = false;
     return false;
+}
+
+// Disable homing required check for more reliable operation
+static void disable_homing_required() {
+    // Force setting $22=0 (Homing not required)
+    send_gcode("$22=0");
+    vTaskDelay(100 / portTICK_PERIOD_MS);
+    debug_msg("Homing required check disabled");
+    
+    // Also unlock and soft-home for good measure
+    send_gcode("$X");
+    vTaskDelay(100 / portTICK_PERIOD_MS);
+    send_gcode("G92 X0 Y0");
+    vTaskDelay(100 / portTICK_PERIOD_MS);
+    debug_msg("Soft homing performed");
 }
 
 // Helper function to get current position
@@ -810,3 +997,5 @@ static void get_current_position(float &x, float &y) {
         y = gc_state.position[Y_AXIS];
     }
 }
+
+
