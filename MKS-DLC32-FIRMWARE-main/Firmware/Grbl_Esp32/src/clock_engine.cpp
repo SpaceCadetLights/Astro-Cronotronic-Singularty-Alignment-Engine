@@ -255,7 +255,7 @@ static void time_to_angles(int hour, int minute, float &hour_angle, float &minut
     hour_angle = (hour % 12) * 30.0f + minute * 0.5f;
 }
 
-// Move clock hands to specific angles - direct linear movement with speed control
+// Move clock hands to specific angles - direct linear movement with shortest path
 static void move_to_angles(float minute_angle, float hour_angle) {
     char cmd[64];
     
@@ -277,15 +277,119 @@ static void move_to_angles(float minute_angle, float hour_angle) {
     float current_hour_angle = 0.0f;
     get_current_position(current_min_angle, current_hour_angle);
     
-    // Calculate movement distances (accounting for wraparound)
-    float min_dist = fabs(minute_angle - current_min_angle);
-    if (min_dist > 180) min_dist = 360 - min_dist;
+    // Normalize current angles to 0-360 range
+    while (current_min_angle < 0) current_min_angle += 360.0f;
+    while (current_min_angle >= 360) current_min_angle -= 360.0f;
+    while (current_hour_angle < 0) current_hour_angle += 360.0f;
+    while (current_hour_angle >= 360) current_hour_angle -= 360.0f;
     
-    float hour_dist = fabs(hour_angle - current_hour_angle);
-    if (hour_dist > 180) hour_dist = 360 - hour_dist;
+    // Calculate shortest path for minute hand
+    float min_dist_cw = (minute_angle >= current_min_angle) ? 
+                        (minute_angle - current_min_angle) : 
+                        (minute_angle + 360.0f - current_min_angle);
+                        
+    float min_dist_ccw = (current_min_angle >= minute_angle) ? 
+                         (current_min_angle - minute_angle) : 
+                         (current_min_angle + 360.0f - minute_angle);
+                         
+    float min_target = current_min_angle;
     
-    // Use the larger distance to calculate movement time
-    float max_distance = max(min_dist, hour_dist);
+    if (min_dist_cw <= min_dist_ccw) {
+        // Clockwise is shorter or equal
+        if (min_dist_cw > 180.0f) {
+            // Need to handle wrap-around
+            // Use an intermediate point to force clockwise movement
+            float intermediate_min = current_min_angle - 10.0f;
+            if (intermediate_min < 0) intermediate_min += 360.0f;
+            min_target = intermediate_min;
+            debug_msg("Minute hand: Using intermediate point %.1f to force clockwise", intermediate_min);
+        } else {
+            min_target = minute_angle;
+        }
+    } else {
+        // Counterclockwise is shorter
+        if (min_dist_ccw > 180.0f) {
+            // Need to handle wrap-around
+            // Use an intermediate point to force counterclockwise movement
+            float intermediate_min = current_min_angle + 10.0f;
+            if (intermediate_min >= 360.0f) intermediate_min -= 360.0f;
+            min_target = intermediate_min;
+            debug_msg("Minute hand: Using intermediate point %.1f to force counterclockwise", intermediate_min);
+        } else {
+            min_target = minute_angle;
+        }
+    }
+    
+    // Calculate shortest path for hour hand
+    float hour_dist_cw = (hour_angle >= current_hour_angle) ? 
+                         (hour_angle - current_hour_angle) : 
+                         (hour_angle + 360.0f - current_hour_angle);
+                         
+    float hour_dist_ccw = (current_hour_angle >= hour_angle) ? 
+                          (current_hour_angle - hour_angle) : 
+                          (current_hour_angle + 360.0f - hour_angle);
+                          
+    float hour_target = current_hour_angle;
+    
+    if (hour_dist_cw <= hour_dist_ccw) {
+        // Clockwise is shorter or equal
+        if (hour_dist_cw > 180.0f) {
+            // Need to handle wrap-around
+            // Use an intermediate point to force clockwise movement
+            float intermediate_hour = current_hour_angle - 10.0f;
+            if (intermediate_hour < 0) intermediate_hour += 360.0f;
+            hour_target = intermediate_hour;
+            debug_msg("Hour hand: Using intermediate point %.1f to force clockwise", intermediate_hour);
+        } else {
+            hour_target = hour_angle;
+        }
+    } else {
+        // Counterclockwise is shorter
+        if (hour_dist_ccw > 180.0f) {
+            // Need to handle wrap-around
+            // Use an intermediate point to force counterclockwise movement
+            float intermediate_hour = current_hour_angle + 10.0f;
+            if (intermediate_hour >= 360.0f) intermediate_hour -= 360.0f;
+            hour_target = intermediate_hour;
+            debug_msg("Hour hand: Using intermediate point %.1f to force counterclockwise", intermediate_hour);
+        } else {
+            hour_target = hour_angle;
+        }
+    }
+    
+    // If we're using intermediate points, make the initial movement
+    bool using_intermediate = (min_target != minute_angle) || (hour_target != hour_angle);
+    
+    if (using_intermediate) {
+        // Make an initial move to the intermediate point
+        // Calculate movement time based on distance
+        float max_intermediate_dist = max(
+            min(min_dist_cw, min_dist_ccw), 
+            min(hour_dist_cw, hour_dist_ccw)
+        );
+        
+        uint32_t intermediate_time_ms = (uint32_t)((max_intermediate_dist / movement_speed) * 1000);
+        if (intermediate_time_ms < 500) intermediate_time_ms = 500; // At least 500ms
+        
+        // Actually move to the intermediate point
+        memset(cmd, 0, sizeof(cmd));
+        snprintf(cmd, sizeof(cmd)-1, "G1 X%.1f Y%.1f F%.1f", min_target, hour_target, movement_speed * 60.0f);
+        debug_msg("Moving to intermediate point X%.1f Y%.1f", min_target, hour_target);
+        send_gcode(cmd);
+        
+        // Wait for the intermediate movement to complete
+        vTaskDelay(intermediate_time_ms / portTICK_PERIOD_MS);
+        
+        // Now update the targets for the final movement
+        min_target = minute_angle;
+        hour_target = hour_angle;
+    }
+    
+    // Use the larger distance to calculate movement time for the main/final move
+    float max_distance = max(
+        min(min_dist_cw, min_dist_ccw), 
+        min(hour_dist_cw, hour_dist_ccw)
+    );
     
     // Calculate movement time in milliseconds based on speed
     uint32_t movement_time_ms = (uint32_t)((max_distance / movement_speed) * 1000);
@@ -329,12 +433,11 @@ static void move_to_angles(float minute_angle, float hour_angle) {
     
     // Create command with angles and speed and send it
     memset(cmd, 0, sizeof(cmd));
-    snprintf(cmd, sizeof(cmd)-1, "G1 X%.1f Y%.1f F%.1f", minute_angle, hour_angle, feedrate);
+    snprintf(cmd, sizeof(cmd)-1, "G1 X%.1f Y%.1f F%.1f", min_target, hour_target, feedrate);
     debug_msg("Moving to X%.1f Y%.1f (speed:%.1f deg/s, est. time:%dms)", 
-              minute_angle, hour_angle, movement_speed, movement_time_ms);
+              min_target, hour_target, movement_speed, movement_time_ms);
     send_gcode(cmd);
     
-    // CRITICAL CHANGE: Don't block WiFi stack with a long delay
     // Wait for movement to complete in small chunks
     debug_msg("Waiting for movement to complete...");
     
@@ -482,8 +585,9 @@ void clockEngineTask(void* parameter) {
             debug_msg("Machine state: %s (%d)", state_str, (int)sys.state);
             last_status = now;
         }
-        
+        //---------------------------------------------------------
         // INITIALIZATION: Always try to clear alarms at startup
+        //--------------------------------------------------------
         if (!system_ready) {
             debug_msg("Initializing system...");
             
@@ -543,11 +647,9 @@ void clockEngineTask(void* parameter) {
             // Move hands to show that the system is alive, even before homing
             debug_msg("Moving hands to show system is active (at reduced speed)");
             movement_enabled = true; // Force movement on
-            move_to_angles(90, 270); // Move to 3:00/9:00 position (perpendicular)
+            move_to_angles(180, 180); // Move to 3:00/9:00 position (perpendicular)
             vTaskDelay(2000 / portTICK_PERIOD_MS); // 2 seconds between movements
-            move_to_angles(180, 180); // Move to 6:00 position (aligned)
-            vTaskDelay(2000 / portTICK_PERIOD_MS); // 2 seconds between movements
-            move_to_angles(0, 0); // Return to 12:00 position
+            move_to_angles(0, 0); // Move to 6:00 position (aligned)
             vTaskDelay(2000 / portTICK_PERIOD_MS); // 2 seconds between movements
             debug_msg("Initial movement test complete, continuing with homing");
         }
@@ -595,16 +697,34 @@ void clockEngineTask(void* parameter) {
             // 6. Now do the test movements AFTER homing is complete
             debug_msg("Beginning test movements");
             float saved_speed = movement_speed;
-            movement_speed = 15.0f; // Slower speed for testing
+            movement_speed = 45.0f; // fast speed for testing
             
-            move_to_angles(90, 270); // 3:00/9:00 position
-            vTaskDelay(2000 / portTICK_PERIOD_MS);
+            // Test HOUR hand (Y axis) - moving to 4 cardinal positions
+            debug_msg("Testing HOUR hand (Y axis)");
+            move_to_angles(0, 90);    // Hour hand at 3:00
+            vTaskDelay(500 / portTICK_PERIOD_MS);
+            move_to_angles(0, 180);   // Hour hand at 6:00
+            vTaskDelay(500 / portTICK_PERIOD_MS);
+            move_to_angles(0, 270);   // Hour hand at 9:00
+            vTaskDelay(500 / portTICK_PERIOD_MS);
+            move_to_angles(0, 0);     // Hour hand at 12:00
+            vTaskDelay(1000 / portTICK_PERIOD_MS);
             
-            move_to_angles(180, 180); // 6:00 position
-            vTaskDelay(2000 / portTICK_PERIOD_MS);
+            // Test MINUTE hand (X axis) - moving to 4 cardinal positions
+            debug_msg("Testing MINUTE hand (X axis)");
+            move_to_angles(90, 0);    // Minute hand at 3:00
+            vTaskDelay(500 / portTICK_PERIOD_MS);
+            move_to_angles(180, 0);   // Minute hand at 6:00
+            vTaskDelay(500 / portTICK_PERIOD_MS);
+            move_to_angles(270, 0);   // Minute hand at 9:00
+            vTaskDelay(500 / portTICK_PERIOD_MS);
+            move_to_angles(0, 0);     // Minute hand at 12:00
+            vTaskDelay(1000 / portTICK_PERIOD_MS);
             
-            move_to_angles(0, 0); // Back to 12:00 position
-            vTaskDelay(2000 / portTICK_PERIOD_MS);
+            // Finally, move both hands to starting position
+            debug_msg("Moving both hands to 12:00 position");
+            move_to_angles(0, 0);     // Both hands at 12:00
+            vTaskDelay(1000 / portTICK_PERIOD_MS);
             
             // Restore normal speed
             movement_speed = saved_speed;
