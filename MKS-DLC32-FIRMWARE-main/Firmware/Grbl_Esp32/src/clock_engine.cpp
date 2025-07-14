@@ -1427,9 +1427,9 @@ void clockEngineTask(void* parameter) {
         
         // Add periodic rehoming
         static uint32_t last_rehome_time = 0;
-        if (now - last_rehome_time > 86400000) { // 24 hours
+        if (now - last_rehome_time > 1800000) { // 30 minutes (was 86400000 for 24 hours)
             if (current_mode == MODE_CURRENT_TIME && sys.state == State::Idle) {
-                debug_msg("Performing periodic rehoming");
+                debug_msg("Performing 30-minute periodic rehoming");
                 rehome_clock();
             }
             last_rehome_time = now;
@@ -1821,6 +1821,7 @@ static void get_current_position(float &x, float &y) {
 static void verify_and_correct_time_position() {
     // 1. Get what the current time angles SHOULD be
     float expected_hour_angle, expected_minute_angle;
+
     time_to_angles(current_hour, current_minute, expected_hour_angle, expected_minute_angle);
     
     // 2. Get what the controller THINKS the current position is
