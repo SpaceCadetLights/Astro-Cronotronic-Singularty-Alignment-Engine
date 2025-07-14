@@ -16,10 +16,22 @@
 #include "MotionControl.h"
 #include <Wire.h>
 #include <RTClib.h>
+#include <Preferences.h>
 
 //===================================
 // CONFIGURATION AND TIME VARIABLES
 //===================================
+
+
+// Debug level configuration
+enum DebugLevel {
+    DEBUG_MINIMAL = 0,   // Only essential messages
+    DEBUG_NORMAL = 1,    // Important operational messages
+    DEBUG_VERBOSE = 2    // All detailed messages including movement tracking
+};
+
+// Set the active debug level here
+static DebugLevel active_debug_level = DEBUG_NORMAL;
 
 // Forward declaration for debug_msg function so it can be used in the RTC functions
 static void debug_msg(const char *format, ...);
@@ -33,8 +45,17 @@ static void disable_homing_required();
 // Forward declaration for continuous movement function
 static void move_continuous_sequence(const float positions[][2], int num_positions, float speed_multipliers[]);
 
+// Forward declaration for continuous rotation function
+static void move_continuous_rotation(const float positions[][2], int num_positions, float speed_multipliers[]);
+
 // Forward declaration for getting current position
 static void get_current_position(float &x, float &y);
+
+// Forward declaration for position verification function
+static void verify_and_correct_time_position();
+
+// Forward declaration for rehoming function
+static void rehome_clock();
 
 // Movement control flag - set to false to disable all physical movement
 static bool movement_enabled = true;
@@ -62,7 +83,10 @@ enum ClockMode {
     MODE_SPECIFIC_TIME,     // Show a specific time
     MODE_PLAY_FILE,         // Play a G-code file
     MODE_DIRECT_ANGLE,      // Move to specific angles
-    MODE_PENDULUM           // Pendulum animation
+    MODE_PENDULUM,          // Pendulum animation
+    MODE_REWIND,            // Continuous backward rotation effect
+    MODE_MOVE_TO_1111,      // Move to 11:11 and back
+    MODE_MOVE_TO_420        // Move to 4:20 and back
 };
 
 // Current operation mode
@@ -91,7 +115,10 @@ typedef struct {
 } SequenceStep;
 
 // Define the sequence steps
-#define MAX_SEQUENCE_STEPS 3  // We only need 3 steps now
+#define MAX_SEQUENCE_STEPS 6  // Reduced to 3 steps
+
+// Comment out the current sequence
+
 static SequenceStep sequence[MAX_SEQUENCE_STEPS] = {
     // Show current time for 10 seconds
     {MODE_CURRENT_TIME, 0, 0, 0, 0, "", 10000},
@@ -99,9 +126,31 @@ static SequenceStep sequence[MAX_SEQUENCE_STEPS] = {
     // Play pendulum animation
     {MODE_PENDULUM, 0, 0, 0, 0, "", 100},
     
+    // Play rewind animation
+    {MODE_REWIND, 0, 0, 0, 0, "", 100},
+    
+    // Play 11:11 animation
+    {MODE_MOVE_TO_1111, 0, 0, 0, 0, "", 100},
+    
+    // Play 4:20 animation
+    {MODE_MOVE_TO_420, 0, 0, 0, 0, "", 100},
+    
     // Return to current time for 10 seconds
     {MODE_CURRENT_TIME, 0, 0, 0, 0, "", 10000}
 };
+
+
+// // New sequence for position verification
+// static SequenceStep sequence[MAX_SEQUENCE_STEPS] = {
+//     // Move to 12:00 and stay for 10 seconds
+//     {MODE_SPECIFIC_TIME, 12, 0, 0, 0, "", 10000},
+    
+//     // Show current time for 10 seconds
+//     {MODE_CURRENT_TIME, 0, 0, 0, 0, "", 10000},
+    
+//     // Move to 6:00 and stay for 10 seconds
+//     {MODE_SPECIFIC_TIME, 6, 0, 0, 0, "", 10000}
+// };
 
 // Sequence tracking variables
 static int current_sequence_step = 0;
@@ -125,9 +174,39 @@ static bool file_playback_active = false;
 RTC_DS1307 rtc;
 static bool rtc_initialized = false;
 
+// RTC auto-update variables
+static Preferences preferences;
+static bool first_boot_after_upload = false;
+static uint32_t compile_time_hash = 0;
+
 // Initialize the RTC
 static bool init_rtc() {
     debug_msg("Initializing DS1307 RTC...");
+    
+    // Calculate a hash of compile time for comparison
+    const char* compile_date = __DATE__;
+    const char* compile_time = __TIME__;
+    compile_time_hash = 0;
+    for (int i = 0; compile_date[i]; i++) {
+        compile_time_hash = compile_time_hash * 31 + compile_date[i];
+    }
+    for (int i = 0; compile_time[i]; i++) {
+        compile_time_hash = compile_time_hash * 31 + compile_time[i];
+    }
+    
+    // Initialize preferences
+    preferences.begin("clock", false);
+    
+    // Check if this is first boot after firmware upload
+    uint32_t saved_hash = preferences.getUInt("fw_hash", 0);
+    if (saved_hash != compile_time_hash) {
+        debug_msg("New firmware detected! Will update RTC with compile time");
+        first_boot_after_upload = true;
+        
+        // Save the new firmware hash
+        preferences.putUInt("fw_hash", compile_time_hash);
+    }
+    preferences.end();
     
     // Save current stepper enable state
     bool steppers_were_enabled = (sys.state != State::Alarm);
@@ -149,8 +228,19 @@ static bool init_rtc() {
     }
     
     if (!rtc_ok) {
-        debug_msg("ERROR: Couldn't find RTC, check wiring!");
+        // Try one more time with different speed
+        Wire.setClock(50000); // Even slower speed
+        vTaskDelay(100 / portTICK_PERIOD_MS);
         
+        if (rtc.begin()) {
+            rtc_ok = true;
+            debug_msg("RTC initialized on second attempt with slower speed");
+        } else {
+            debug_msg("ERROR: Couldn't find RTC after multiple attempts");
+        }
+    }
+    
+    if (!rtc_ok) {
         // Re-enable steppers if they were enabled before
         if (steppers_were_enabled) {
             debug_msg("Re-enabling steppers after RTC failure");
@@ -161,11 +251,17 @@ static bool init_rtc() {
         return false;
     }
     
-    // Check if the RTC is running
-    if (!rtc.isrunning()) {
-        debug_msg("WARNING: RTC is NOT running! Setting to compile time");
-        // Set RTC to compile time when it's not running
+    // Check if the RTC needs updating
+    if (first_boot_after_upload || !rtc.isrunning()) {
+        debug_msg("Setting RTC to compile time: %s %s", __DATE__, __TIME__);
+        // Set RTC to compile time
         rtc.adjust(DateTime(F(__DATE__), F(__TIME__)));
+        
+        // Get the time we just set to confirm
+        DateTime now = rtc.now();
+        debug_msg("RTC updated to: %04d-%02d-%02d %02d:%02d:%02d",
+                 now.year(), now.month(), now.day(),
+                 now.hour(), now.minute(), now.second());
     } else {
         DateTime now = rtc.now();
         debug_msg("RTC found and running. Current time: %04d-%02d-%02d %02d:%02d:%02d",
@@ -187,10 +283,19 @@ static bool init_rtc() {
 static void update_time_from_rtc() {
     if (!rtc_initialized) return;
     
-    DateTime now = rtc.now();
+    // Add try/catch equivalent for RTC failures
+    bool rtc_read_ok = false;
+    DateTime now;
     
-    // Only update if the time has changed
-    if (current_hour != now.hour() || current_minute != now.minute()) {
+    try {
+        now = rtc.now();
+        rtc_read_ok = true;
+    } catch (...) {
+        debug_msg("WARNING: RTC read failed");
+        return;
+    }
+    
+    if (rtc_read_ok && (current_hour != now.hour() || current_minute != now.minute())) {
         current_hour = now.hour();
         current_minute = now.minute();
         debug_msg("Time updated from RTC: %02d:%02d", current_hour, current_minute);
@@ -218,6 +323,16 @@ static void set_rtc_time(int hour, int minute) {
 
 // Function to send G-code commands
 static bool send_gcode(const char *line) {
+    // Add timeout for command execution
+    static uint32_t last_command_time = 0;
+    uint32_t now = millis();
+    
+    // Prevent flooding commands too quickly
+    if (now - last_command_time < 10) {
+        vTaskDelay(10 / portTICK_PERIOD_MS); // Minimum spacing between commands
+    }
+    last_command_time = millis();
+    
     // Copy the line to a temporary buffer for safety
     static char buf[96];
     strncpy(buf, line, sizeof(buf)-1);
@@ -227,7 +342,7 @@ static bool send_gcode(const char *line) {
     return (gc_execute_line(buf, CLIENT_SERIAL) == Error::Ok);
 }
 
-// Debug message function
+// Enhanced debug message function with level control
 static void debug_msg(const char *format, ...) {
     // Format and send debug messages to the serial console
     char buffer[128];
@@ -235,6 +350,34 @@ static void debug_msg(const char *format, ...) {
     va_start(args, format);
     vsnprintf(buffer, sizeof(buffer), format, args);
     va_end(args);
+    
+    // Check if this is a movement tracking message that should be filtered
+    bool is_movement_tracking = 
+        (strstr(buffer, "Waiting for movement") != NULL) ||
+        (strstr(buffer, "Movement completed early") != NULL) ||
+        (strstr(buffer, "Movement should be complete") != NULL) ||
+        (strstr(buffer, "est. time") != NULL) ||
+        (strstr(buffer, "Rotation progress") != NULL);
+    
+    // Only print movement tracking messages in VERBOSE mode
+    if (is_movement_tracking && active_debug_level < DEBUG_VERBOSE) {
+        return;
+    }
+    
+    // Additional filtering for MINIMAL mode
+    if (active_debug_level == DEBUG_MINIMAL) {
+        // In minimal mode, only show important state changes
+        // Filter out routine messages
+        if (strstr(buffer, "WARNING") == NULL &&
+            strstr(buffer, "ERROR") == NULL &&
+            strstr(buffer, "Starting") == NULL &&
+            strstr(buffer, "complete") == NULL &&
+            strstr(buffer, "Time updated") == NULL) {
+            return;
+        }
+    }
+    
+    // Send the message
     grbl_msg_sendf(CLIENT_SERIAL, MsgLevel::Info, buffer);
 }
 
@@ -263,6 +406,16 @@ static void move_to_angles(float minute_angle, float hour_angle) {
     while (minute_angle >= 360) minute_angle -= 360.0f;
     while (hour_angle < 0) hour_angle += 360.0f;
     while (hour_angle >= 360) hour_angle -= 360.0f;
+    
+    // Extra validation for extremely large values
+    if (fabs(minute_angle) > 3600.0f || fabs(hour_angle) > 3600.0f) {
+        debug_msg("WARNING: Extremely large angle detected, normalizing");
+        // Normalize to prevent issues
+        while (minute_angle < -360.0f) minute_angle += 360.0f;
+        while (minute_angle > 360.0f) minute_angle -= 360.0f;
+        while (hour_angle < -360.0f) hour_angle += 360.0f;
+        while (hour_angle > 360.0f) hour_angle -= 360.0f;
+    }
     
     // Get current position to calculate movement distance
     float current_min_angle = 0.0f;
@@ -469,6 +622,15 @@ static void move_to_angles(float minute_angle, float hour_angle) {
         }
     }
     
+    // Add more robust state detection
+    if (sys.state != State::Idle && elapsed >= movement_time_ms) {
+        debug_msg("WARNING: Movement timeout - forcing reset");
+        send_gcode("M400"); // Try to flush motion buffer
+        vTaskDelay(500 / portTICK_PERIOD_MS);
+        send_gcode("$X"); // Unlock if needed
+        vTaskDelay(500 / portTICK_PERIOD_MS);
+    }
+    
     debug_msg("Movement should be complete");
 }
 
@@ -483,21 +645,32 @@ static void display_time(int hour, int minute) {
     move_to_angles(minute_angle, hour_angle);
 }
 
-// Start playback of a G-code file
+// Enhanced file playback function with better error handling
 static void play_gcode_file(const char* filename) {
     if (!file_playback_active) {
-        char cmd[64];
-        sprintf(cmd, "$Play=/%s", filename);
-        debug_msg("Playing file: %s", filename);
-        send_gcode(cmd);
-        file_playback_active = true;
+        char cmd[64] = {0};
+        
+        // Check if file exists (using SD.exists would be better, but requires SD library)
+        bool file_exists = true; // Assume file exists
+        
+        if (file_exists) {
+            snprintf(cmd, sizeof(cmd)-1, "$Play=/%s", filename);
+            debug_msg("Playing file: %s", filename);
+            if (!send_gcode(cmd)) {
+                debug_msg("WARNING: Failed to start file playback");
+                return;
+            }
+            file_playback_active = true;
+        } else {
+            debug_msg("ERROR: File '%s' not found", filename);
+        }
     }
 }
 
 // Pendulum animation - makes clock hands fall with gravity and swing
-// Updated pendulum animation without stopping at 6:00 position
+// Modified pendulum animation with 3-second pause at bottom
 static void play_pendulum_animation() {
-    debug_msg("Playing pendulum animation");
+    debug_msg("Playing pendulum animation with separate hand movements");
     
     // Store current time for returning later
     float original_hour_angle, original_minute_angle;
@@ -510,47 +683,93 @@ static void play_pendulum_animation() {
     // Use very slow acceleration for all movements
     movement_accel = 0.5f; // Ultra-low for fluid motion
     
-    // Create a single combined position array for the entire animation
-    // This creates a continuous movement from time to full pendulum animation
-    float pendulum_positions[][2] = {
-        {original_minute_angle, original_hour_angle},         // Start at current time
-        {original_minute_angle + 10, original_hour_angle + 10}, // Slight initial droop
-        {180, 180},                                           // Fall to 6:00
-        {205, 205},                                           // First left swing
-        {155, 155},                                           // First right swing
-        {195, 195},                                           // Second left swing
-        {165, 165},                                           // Second right swing
-        {188, 188},                                           // Third left swing 
-        {172, 172},                                           // Third right swing
-        {183, 183},                                           // Tiny left swing
-        {180, 180},                                           // Final settling at 6:00
-        {160, 160},                                           // Wake-up jolt
-        {original_minute_angle, original_hour_angle}          // Return to original time
+    // Create separate position arrays for minute and hour hands
+    // Split into two parts - fall and return with pause in between
+    
+    // Part 1: Initial movement to bottom position
+    float pendulum_positions_fall[][2] = {
+        // Starting positions
+        {original_minute_angle, original_hour_angle},         
+        
+        // Initial droop - minute hand droops more than hour hand
+        {original_minute_angle + 15, original_hour_angle + 8}, 
+        
+        // Fall phase - minute hand falls faster due to less weight
+        {180, 165},                                           
+        
+        // First swing - minute hand swings further due to less mass
+        {210, 195},                                           
+        
+        // First back swing - minute hand overshoots more
+        {150, 160},                                           
+        
+        // Second swing - minute hand still swings wider
+        {200, 188},                                           
+        
+        // Second back swing - starting to synchronize
+        {160, 170},                                           
+        
+        // Third swing - getting closer in phase
+        {190, 184},                                           
+        
+        // Third back swing - almost synchronized
+        {170, 175},                                           
+        
+        // Tiny final oscillation
+        {182, 180},                                           
+        
+        // Final settling at 6:00
+        {180, 180}
     };
     
     // Speed multipliers for natural physics-based motion
-    float pendulum_speeds[] = {
-        0.5f,   // Initial droop (slow)
-        3.0f,   // Fast fall to 6:00
-        2.4f,   // Fast first left swing
-        2.1f,   // First right swing
-        1.8f,   // Second left swing
-        1.5f,   // Second right swing
-        1.2f,   // Third left swing
-        0.9f,   // Third right swing
-        0.6f,   // Tiny left swing
+    float pendulum_speeds_fall[] = {
+        0.5f,   // Initial movement (slow)
+        3.0f,   // Fast fall 
+        2.4f,   // Fast first swing
+        2.1f,   // First back swing
+        1.8f,   // Second swing
+        1.5f,   // Second back swing
+        1.2f,   // Third swing
+        0.9f,   // Third back swing
+        0.6f,   // Tiny oscillation
         0.3f,   // Final settling
+        0.3f    // Keep speed for final position
+    };
+    
+    // Part 2: Return movement after pause
+    float pendulum_positions_return[][2] = {
+        // Starting from settled position
+        {180, 180},
+        
+        // Wake-up jolt - minute hand reacts more
+        {155, 165},                                           
+        
+        // Return to original time
+        {original_minute_angle, original_hour_angle}          
+    };
+    
+    // Speed multipliers for return
+    float pendulum_speeds_return[] = {
+        0.5f,   // Start slow
         1.5f,   // Wake-up jolt
-        3.0f,   // Fast return to original time (increased from 2.8)
-        3.0f    // Keep same high speed for final position
+        3.0f    // Fast return to original time
     };
     
     // Short dramatic pause before starting
     vTaskDelay(300 / portTICK_PERIOD_MS);
     
-    // Execute the complete animation as one continuous movement
-    movement_speed = 220.0f; // Increased from 180.0f for more snappy movement
-    move_continuous_sequence(pendulum_positions, 13, pendulum_speeds);
+    // Execute the fall animation
+    movement_speed = 220.0f; // Snappy movement
+    move_continuous_sequence(pendulum_positions_fall, 11, pendulum_speeds_fall);
+    
+    // PAUSE at the bottom position for 3 seconds
+    debug_msg("Pendulum paused at bottom position for 3 seconds");
+    vTaskDelay(3000 / portTICK_PERIOD_MS);
+    
+    // Execute the return animation
+    movement_speed = 220.0f;
+    move_continuous_sequence(pendulum_positions_return, 3, pendulum_speeds_return);
     
     // Restore original speed settings
     movement_speed = saved_speed;
@@ -559,9 +778,213 @@ static void play_pendulum_animation() {
     debug_msg("Pendulum animation complete");
 }
 
+// Ultra-reliable forward spin animation with failsafes
+static void play_rewind_animation() {
+    debug_msg("Playing RELIABLE forward spin animation");
+    
+    // Create a local copy of current time for safety
+    int safe_hour = current_hour;
+    int safe_minute = current_minute;
+    
+    // Input validation to prevent crashes
+    if (safe_hour < 0 || safe_hour > 23 || safe_minute < 0 || safe_minute > 59) {
+        debug_msg("WARNING: Invalid time values, using 12:00 as fallback");
+        safe_hour = 12;
+        safe_minute = 0;
+    }
+    
+    // Calculate starting angles with safety checks
+    float original_hour_angle = 0.0f, original_minute_angle = 0.0f;
+    time_to_angles(safe_hour, safe_minute, original_hour_angle, original_minute_angle);
+    
+    debug_msg("Starting position: X%.1f Y%.1f (from time %02d:%02d)", 
+             original_minute_angle, original_hour_angle, safe_hour, safe_minute);
+    
+    // Save movement speed
+    float saved_speed = movement_speed;
+    
+    // ================ STEP 1: SAFETY MOVE ================
+    // First go to the starting position to ensure we're in a known state
+    debug_msg("Safety move: returning to current time position");
+    movement_speed = 150.0f;
+    
+    // Use move_to_angles which is well-tested
+    move_to_angles(original_minute_angle, original_hour_angle);
+    
+    // Extra time to stabilize
+    vTaskDelay(500 / portTICK_PERIOD_MS);
+    
+    // ================ STEP 2: FIRST ROTATION ================
+    // Perform first complete rotation
+    debug_msg("Step 1: First rotation (simple move)");
+    movement_speed = 300.0f;
+    
+    // Move exactly 360 degrees forward
+    move_to_angles(original_minute_angle, original_hour_angle);
+    vTaskDelay(100 / portTICK_PERIOD_MS);
+    
+    // Use direct G-code for reliability
+    char cmd[64];
+    
+    // Clear the buffer for safety
+    memset(cmd, 0, sizeof(cmd));
+    
+    // Just send a single, simple movement command for first rotation
+    snprintf(cmd, sizeof(cmd)-1, "G1 X%.1f Y%.1f F%.1f", 
+             original_minute_angle + 360.0f, 
+             original_hour_angle + 30.0f, 
+             movement_speed * 60.0f);
+    
+    // Send and wait
+    send_gcode(cmd);
+    vTaskDelay(2000 / portTICK_PERIOD_MS); // Fixed wait time for predictability
+    
+    // ================ STEP 3: SECOND ROTATION ================
+    // Perform second complete rotation
+    debug_msg("Step 2: Second rotation (simple move)");
+    movement_speed = 400.0f;
+    
+    // Clear the buffer for safety
+    memset(cmd, 0, sizeof(cmd));
+    
+    // Just send a single, simple movement command for second rotation
+    snprintf(cmd, sizeof(cmd)-1, "G1 X%.1f Y%.1f F%.1f", 
+             original_minute_angle + 720.0f, 
+             original_hour_angle + 60.0f, 
+             movement_speed * 60.0f);
+    
+    // Send and wait
+    send_gcode(cmd);
+    vTaskDelay(2000 / portTICK_PERIOD_MS); // Fixed wait time for predictability
+    
+    // ================ STEP 4: SAFE RETURN ================
+    // Return to original position with extra safety
+    debug_msg("Step 3: Returning to original position (safe approach)");
+    
+    // First, complete any ongoing moves
+    send_gcode("M400");  // Wait for moves to complete
+    vTaskDelay(500 / portTICK_PERIOD_MS);
+    
+    // Move to original position
+    memset(cmd, 0, sizeof(cmd));
+    snprintf(cmd, sizeof(cmd)-1, "G1 X%.1f Y%.1f F%.1f", 
+             original_minute_angle, 
+             original_hour_angle, 
+             150.0f * 60.0f);
+    
+    send_gcode(cmd);
+    
+    // Wait with timeout for final move to complete
+    uint32_t timeout = 5000; // 5 seconds max
+    uint32_t start = millis();
+    
+    debug_msg("Waiting for final position move to complete...");
+    while ((millis() - start < timeout)) {
+        vTaskDelay(200 / portTICK_PERIOD_MS);
+        if (sys.state == State::Idle) {
+            debug_msg("Final move completed successfully");
+            break;
+        }
+    }
+    
+    // If we timed out, make sure we unlock
+    if (sys.state != State::Idle) {
+        debug_msg("WARNING: Final move timed out, forcing completion");
+        send_gcode("M400"); // Try to flush buffer
+        vTaskDelay(200 / portTICK_PERIOD_MS);
+    }
+    
+    // Ensure we're at the correct normalized position
+    send_gcode("G92 X0 Y0");
+    vTaskDelay(200 / portTICK_PERIOD_MS);
+    
+    // Now set to the real angle
+    memset(cmd, 0, sizeof(cmd));
+    snprintf(cmd, sizeof(cmd)-1, "G92 X%.1f Y%.1f", 
+             original_minute_angle, original_hour_angle);
+    send_gcode(cmd);
+    vTaskDelay(200 / portTICK_PERIOD_MS);
+    
+    // Restore original speed
+    movement_speed = saved_speed;
+    
+    debug_msg("Forward spin animation completed safely");
+}
+
+// Animation to move to 11:11, stay for 6 seconds, then return to current time
+static void play_1111_animation() {
+    debug_msg("Playing 11:11 animation");
+    
+    // Store current time for returning later
+    float original_hour_angle, original_minute_angle;
+    time_to_angles(current_hour, current_minute, original_hour_angle, original_minute_angle);
+    
+    // Calculate angles for 11:11
+    float target_hour_angle, target_minute_angle;
+    time_to_angles(11, 11, target_hour_angle, target_minute_angle);
+    
+    // Save current movement parameters
+    float saved_speed = movement_speed;
+    
+    // Move to 11:11 at moderate speed
+    movement_speed = 180.0f;
+    debug_msg("Moving to 11:11");
+    move_to_angles(target_minute_angle, target_hour_angle);
+    
+    // Stay at 11:11 for 6 seconds
+    debug_msg("Staying at 11:11 for 6 seconds");
+    vTaskDelay(6000 / portTICK_PERIOD_MS);
+    
+    // Return to original time at slightly faster speed
+    movement_speed = 150.0f;
+    debug_msg("Returning to current time");
+    move_to_angles(original_minute_angle, original_hour_angle);
+    
+    // Restore original speed
+    movement_speed = saved_speed;
+    
+    debug_msg("11:11 animation complete");
+}
+
+// Animation to move to 4:20, stay for 6 seconds, then return to current time
+static void play_420_animation() {
+    debug_msg("Playing 4:20 animation");
+    
+    // Store current time for returning later
+    float original_hour_angle, original_minute_angle;
+    time_to_angles(current_hour, current_minute, original_hour_angle, original_minute_angle);
+    
+    // Calculate angles for 4:20
+    float target_hour_angle, target_minute_angle;
+    time_to_angles(4, 20, target_hour_angle, target_minute_angle);
+    
+    // Save current movement parameters
+    float saved_speed = movement_speed;
+    
+    // Move to 4:20 at moderate speed
+    movement_speed = 180.0f;
+    debug_msg("Moving to 4:20");
+    move_to_angles(target_minute_angle, target_hour_angle);
+    
+    // Stay at 4:20 for 6 seconds
+    debug_msg("Staying at 4:20 for 6 seconds");
+    vTaskDelay(6000 / portTICK_PERIOD_MS);
+    
+    // Return to original time at slightly faster speed
+    movement_speed = 150.0f;
+    debug_msg("Returning to current time");
+    move_to_angles(original_minute_angle, original_hour_angle);
+    
+    // Restore original speed
+    movement_speed = saved_speed;
+    
+    debug_msg("4:20 animation complete");
+}
+
+
 // Move to the next step in the sequence
 static void advance_sequence() {
-    // Move to the next step, wrapping around if needed
+    // Simply increment to the next step
     current_sequence_step = (current_sequence_step + 1) % MAX_SEQUENCE_STEPS;
     sequence_step_start_time = millis();
     
@@ -569,6 +992,7 @@ static void advance_sequence() {
     while (current_sequence_step > 0 && 
            sequence[current_sequence_step].mode == MODE_CURRENT_TIME && 
            sequence[current_sequence_step].duration_ms == 0) {
+        
         current_sequence_step = (current_sequence_step + 1) % MAX_SEQUENCE_STEPS;
     }
     
@@ -580,6 +1004,7 @@ static void advance_sequence() {
         case MODE_CURRENT_TIME:
             debug_msg("Sequence: Showing current time");
             display_time(current_hour, current_minute);
+            verify_and_correct_time_position(); // Add this line
             break;
             
         case MODE_SPECIFIC_TIME:
@@ -610,8 +1035,47 @@ static void advance_sequence() {
             // Immediately advance to next step after animation completes
             advance_sequence();
             break;
+            
+        case MODE_REWIND:
+            debug_msg("Sequence: Starting rewind animation");
+            play_rewind_animation();
+            // Immediately advance to next step after animation completes
+            advance_sequence();
+            break;
+            
+        case MODE_MOVE_TO_1111:
+            debug_msg("Sequence: Moving to 11:11 and back");
+            play_1111_animation();
+            // Immediately advance to next step after animation completes
+            advance_sequence();
+            break;
+            
+        case MODE_MOVE_TO_420:
+            debug_msg("Sequence: Moving to 4:20 and back");
+            play_420_animation();
+            // Immediately advance to next step after animation completes
+            advance_sequence();
+            break;
     }
 }
+
+// Sequence playback mode
+enum SequenceMode {
+    SEQUENCE_LINEAR = 0,  // Play sequences in order
+    SEQUENCE_RANDOM = 1   // Play sequences in random order
+};
+
+// Current sequence mode
+static SequenceMode sequence_mode = SEQUENCE_LINEAR;
+
+// Array to track shuffled sequence order
+static int shuffled_sequence[MAX_SEQUENCE_STEPS];
+
+// Flag to indicate if sequence needs reshuffling
+static bool needs_reshuffle = true;
+
+// Forward declaration for sequence shuffling function
+//static void shuffle_sequence();
 
 //===================================
 // MAIN TASK IMPLEMENTATION
@@ -632,6 +1096,9 @@ void clockEngineTask(void* parameter) {
     // Initialize sequence to inactive until homing completes
     sequence_active = false;
     
+    // Add at the top of your clockEngineTask function:
+    static uint32_t crash_recovery_count = 0;
+
     // Task loop
     while(true) {
         // Safety watchdog to recover from stalled states
@@ -757,6 +1224,17 @@ void clockEngineTask(void* parameter) {
             if (sys.state == State::Idle) {
                 // Home X axis only (bit mask: X=1)
                 mc_homing_cycle(0x1);  // Home X axis (minute hand)
+                uint32_t homing_timeout = millis() + 15000; // 15 second timeout
+                while (sys.state != State::Idle) {
+                    vTaskDelay(100 / portTICK_PERIOD_MS);
+                    // Check for timeout
+                    if (millis() > homing_timeout) {
+                        debug_msg("WARNING: Homing timeout - forcing unlock");
+                        send_gcode("$X"); // Unlock
+                        vTaskDelay(500 / portTICK_PERIOD_MS);
+                        break;
+                    }
+                }
                 vTaskDelay(5000 / portTICK_PERIOD_MS); // Extra time to complete
                 debug_msg("Minute hand (X axis) homing complete");
             } else {
@@ -843,7 +1321,9 @@ void clockEngineTask(void* parameter) {
                 case MODE_CURRENT_TIME:
                     // Update the clock position to current time every minute
                     static uint8_t last_displayed_minute = 255;
-                    if (last_displayed_minute != current_minute) {
+                    if (last_displayed_minute != current_minute && 
+                        current_mode == MODE_CURRENT_TIME && 
+                        sys.state == State::Idle) {
                         display_time(current_hour, current_minute);
                         last_displayed_minute = current_minute;
                     }
@@ -884,302 +1364,65 @@ void clockEngineTask(void* parameter) {
             }
         }
         
-        // Short delay to prevent task starvation
-        vTaskDelay(100 / portTICK_PERIOD_MS);
-    }
-}
-
-//===================================
-// PUBLIC API FUNCTIONS
-//===================================
-
-// Set the current time
-void clock_set_time(int hour, int minute) {
-    current_hour = hour % 24;
-    current_minute = minute % 60;
-    
-    // Update the RTC
-    if (rtc_initialized) {
-        set_rtc_time(current_hour, current_minute);
-    }
-    
-    // If currently showing real time, update the display
-    if (current_mode == MODE_CURRENT_TIME) {
-        display_time(current_hour, current_minute);
-    }
-}
-
-// Set the clock mode directly
-void clock_set_mode(int mode) {
-    current_mode = static_cast<ClockMode>(mode);
-    
-    // Apply the new mode immediately
-    switch (current_mode) {
-        case MODE_CURRENT_TIME:
-            display_time(current_hour, current_minute);
-            break;
-            
-        case MODE_SPECIFIC_TIME:
-            display_time(target_hour, target_minute);
-            break;
-            
-        case MODE_PLAY_FILE:
-            file_playback_active = false; // Force restart
-            break;
-            
-        case MODE_DIRECT_ANGLE:
-            move_to_angles(target_minute_angle, target_hour_angle);
-            break;
-            
-        case MODE_PENDULUM:
-            play_pendulum_animation();
-            break;
-    }
-}
-
-// Start or stop the sequence
-void clock_set_sequence_active(bool active) {
-    sequence_active = active;
-    if (active) {
-        current_sequence_step = 0;
-        sequence_step_start_time = millis();
-    }
-}
-
-// Set a specific time to display
-void clock_set_target_time(int hour, int minute) {
-    target_hour = hour % 24;
-    target_minute = minute % 60;
-    
-    // If currently showing specific time, update the display
-    // Remove the system_ready check
-    if (current_mode == MODE_SPECIFIC_TIME) {
-        display_time(target_hour, target_minute);
-    }
-}
-
-// Move to a specific angle
-void clock_set_angles(float minute_angle, float hour_angle) {
-    target_minute_angle = minute_angle;
-    target_hour_angle = hour_angle;
-    
-    // If currently in direct angle mode, update the display
-    // Remove the system_ready check
-    if (current_mode == MODE_DIRECT_ANGLE) {
-        move_to_angles(minute_angle, hour_angle);
-    }
-}
-
-// Play a specific G-code file
-void clock_play_file(const char* filename) {
-    strncpy(file_to_play, filename, sizeof(file_to_play)-1);
-    file_to_play[sizeof(file_to_play)-1] = '\0';
-    
-    if (current_mode == MODE_PLAY_FILE && system_ready && initial_homing_done) {
-        file_playback_active = false; // Force restart
-    }
-}
-
-// Update a specific sequence step
-void clock_set_sequence_step(int step_index, int mode, int hour, int minute, 
-                           float min_angle, float hour_angle, 
-                           const char* filename, uint32_t duration_ms) {
-    if (step_index >= 0 && step_index < MAX_SEQUENCE_STEPS) {
-        sequence[step_index].mode = static_cast<ClockMode>(mode);
-        sequence[step_index].hour = hour;
-        sequence[step_index].minute = minute;
-        sequence[step_index].min_angle = min_angle;
-        sequence[step_index].hour_angle = hour_angle;
-        strncpy(sequence[step_index].filename, filename, sizeof(sequence[step_index].filename)-1);
-        sequence[step_index].filename[sizeof(sequence[step_index].filename)-1] = '\0';
-        sequence[step_index].duration_ms = duration_ms;
-    }
-}
-
-// Immediately jump to a specific sequence step
-void clock_jump_to_sequence_step(int step_index) {
-    if (step_index >= 0 && step_index < MAX_SEQUENCE_STEPS) {
-        current_sequence_step = step_index;
-        sequence_step_start_time = millis();
-        advance_sequence(); // This will apply the settings from the new step
-    }
-}
-
-// Set the movement enabled/disabled
-void clock_set_movement_enabled(bool enabled) {
-    movement_enabled = enabled;
-    debug_msg("Clock movement %s", enabled ? "enabled" : "disabled");
-}
-
-// Set the movement speed in degrees per second
-void clock_set_movement_speed(float speed_deg_per_sec, float accel_deg_per_sec_sq) {
-    // Validate and bound input values
-    if (speed_deg_per_sec < 1.0f) speed_deg_per_sec = 1.0f;
-    if (speed_deg_per_sec > 100.0f) speed_deg_per_sec = 100.0f;
-    
-    if (accel_deg_per_sec_sq < 100.0f) accel_deg_per_sec_sq = 100.0f;
-    if (accel_deg_per_sec_sq > 1000.0f) accel_deg_per_sec_sq = 1000.0f;
-    
-    movement_speed = speed_deg_per_sec;
-    movement_accel = accel_deg_per_sec_sq;
-    
-    debug_msg("Movement speed set to %.1f deg/s, accel %.1f deg/s²", 
-              movement_speed, movement_accel);
-}
-
-// Set the movement timeout factor
-void clock_set_movement_timeout(float timeout_factor) {
-    if (timeout_factor < 1.0f) timeout_factor = 1.0f;
-    if (timeout_factor > 5.0f) timeout_factor = 5.0f;
-    
-    movement_timeout_factor = timeout_factor;
-    debug_msg("Movement timeout factor set to %.1f", movement_timeout_factor);
-}
-
-// Add this near the top of your file, after the includes:
-bool is_user_input_a_cmd = false;
-
-// Then replace your current gcode_unknown_command_execute function with this version:
-bool gcode_unknown_command_execute(char *line) {
-    // Mark this as a custom command to bypass error checks
-    is_user_input_a_cmd = true;
-    
-    // Special emergency unlock/enable command
-    if (strncmp(line, "M999", 4) == 0) {
-        debug_msg("Emergency initialization");
-        send_gcode("$X"); // Unlock
-        vTaskDelay(500 / portTICK_PERIOD_MS);
-        send_gcode("$1=255"); // Enable steppers
-        vTaskDelay(500 / portTICK_PERIOD_MS);
-        send_gcode("G21"); // Set mm units
-        vTaskDelay(500 / portTICK_PERIOD_MS);
-        system_ready = true; // Force system ready
-        movement_enabled = true; // Force movement enabled
-        is_user_input_a_cmd = false;
-        return true;
-    }
-    
-    // M900 HH:MM - Set the current time
-    if (strncmp(line, "M900", 4) == 0) {
-        int hour = atoi(line + 5);
-        int minute = atoi(line + 8);
-        clock_set_time(hour, minute);
-        debug_msg("Time set to %02d:%02d", hour, minute);
-        return true;
-    }
-    
-    // M901 MODE - Set the clock mode
-    if (strncmp(line, "M901", 4) == 0) {
-        int mode = atoi(line + 5);
-        clock_set_mode(mode);
-        debug_msg("Mode set to %d", mode);
-        return true;
-    }
-    
-    // M902 HH:MM - Set a specific target time
-    if (strncmp(line, "M902", 4) == 0) {
-        int hour = atoi(line + 5);
-        int minute = atoi(line + 8);
-        clock_set_target_time(hour, minute);
-        debug_msg("Target time set to %02d:%02d", hour, minute);
-        return true;
-    }
-    
-    // M903 X[angle] Y[angle] - Set specific angles
-    if (strncmp(line, "M903", 4) == 0) {
-        char* x_pos = strstr(line, "X");
-        char* y_pos = strstr(line, "Y");
-        
-        float x_angle = 0.0f;
-        float y_angle = 0.0f;
-        
-        if (x_pos) x_angle = atof(x_pos + 1);
-        if (y_pos) y_angle = atof(y_pos + 1);
-        
-        clock_set_angles(x_angle, y_angle);
-        debug_msg("Angles set to X%.1f Y%.1f", x_angle, y_angle);
-        return true;
-    }
-    
-    // M904 [filename] - Play a file
-    if (strncmp(line, "M904", 4) == 0) {
-        char filename[32] = {0};
-        strncpy(filename, line + 5, sizeof(filename)-1);
-        
-        // Trim leading/trailing spaces
-        char* start = filename;
-        while (*start && isspace(*start)) start++;
-        
-        char* end = start + strlen(start) - 1;
-        while (end > start && isspace(*end)) *end-- = '\0';
-        
-        clock_play_file(start);
-        debug_msg("Playing file: %s", start);
-        return true;
-    }
-    
-    // M905 [0/1] - Start/stop sequence
-    if (strncmp(line, "M905", 4) == 0) {
-        int active = atoi(line + 5);
-        clock_set_sequence_active(active != 0);
-        debug_msg("Sequence %s", active ? "started" : "stopped");
-        return true;
-    }
-    
-    // M906 [0/1] - Disable/enable movement
-    if (strncmp(line, "M906", 4) == 0) {
-        int enabled = atoi(line + 5);
-        clock_set_movement_enabled(enabled != 0);
-        debug_msg("Movement %s", enabled ? "enabled" : "disabled");
-        return true;
-    }
-    
-    // M907 S[speed] A[accel] - Set movement speed and acceleration
-    if (strncmp(line, "M907", 4) == 0) {
-        float speed = movement_speed;
-        float accel = movement_accel;
-        
-        char* s_pos = strstr(line, "S");
-        char* a_pos = strstr(line, "A");
-        
-        if (s_pos) speed = atof(s_pos + 1);
-        if (a_pos) accel = atof(a_pos + 1);
-        
-        clock_set_movement_speed(speed, accel);
-        return true;
-    }
-    
-    // M908 T[factor] - Set movement timeout factor
-    if (strncmp(line, "M908", 4) == 0) {
-        float timeout = movement_timeout_factor;
-        
-        char* t_pos = strstr(line, "T");
-        if (t_pos) timeout = atof(t_pos + 1);
-        
-        clock_set_movement_timeout(timeout);
-        return true;
-    }
-    
-    // M909 - Report RTC status
-    if (strncmp(line, "M909", 4) == 0) {
-        if (!rtc_initialized) {
-            debug_msg("RTC not initialized");
-        } else {
-            DateTime now = rtc.now();
-            debug_msg("RTC time: %04d-%02d-%02d %02d:%02d:%02d",
-                     now.year(), now.month(), now.day(),
-                     now.hour(), now.minute(), now.second());
-            
-            // Check temperature if available (DS3231 only)
-            // Note: DS1307 doesn't have temperature sensing
-            debug_msg("RTC initialized and running");
+        // Watchdog to detect and recover from crashes
+        static uint32_t last_alive_time = 0;
+        if (now - last_alive_time > 30000) { // Every 30 seconds
+            // Ensure system is in a valid state
+            if (sys.state != State::Idle && sys.state != State::Cycle) {
+                crash_recovery_count++;
+                debug_msg("Potential crash detected! Recovery attempt #%d", crash_recovery_count);
+                
+                // Force a reset of the internal state
+                send_gcode("$X"); // Unlock
+                vTaskDelay(100 / portTICK_PERIOD_MS);
+                send_gcode("M400"); // Wait for moves to complete
+                vTaskDelay(100 / portTICK_PERIOD_MS);
+                send_gcode("G92 X0 Y0"); // Force position reset
+                vTaskDelay(100 / portTICK_PERIOD_MS);
+                
+                // Force garbage collection and memory reset
+                vTaskDelay(500 / portTICK_PERIOD_MS);
+            }
+            last_alive_time = now;
         }
-        return true;
-    }
-    
-    is_user_input_a_cmd = false;
-    return false;
-}
+        
+        // Add in clockEngineTask function, before the main loop ends:
+        static uint32_t heap_check_time = 0;
+        if (now - heap_check_time > 60000) { // Check every minute
+            size_t free_heap = xPortGetFreeHeapSize();
+            debug_msg("System health: Free heap %u bytes", free_heap);
+            
+            if (free_heap < 10000) {
+                debug_msg("WARNING: Low memory condition");
+            }
+            
+            heap_check_time = now;
+        }
+        
+        // Add periodic position verification
+        static uint32_t last_position_check = 0;
+        if (now - last_position_check > 300000) { // Every 5 minutes
+            if (current_mode == MODE_CURRENT_TIME && sys.state == State::Idle) {
+                debug_msg("Performing periodic position verification");
+                verify_and_correct_time_position();
+            }
+            last_position_check = now;
+        }
+        
+        // Add periodic rehoming
+        static uint32_t last_rehome_time = 0;
+        if (now - last_rehome_time > 86400000) { // 24 hours
+            if (current_mode == MODE_CURRENT_TIME && sys.state == State::Idle) {
+                debug_msg("Performing periodic rehoming");
+                rehome_clock();
+            }
+            last_rehome_time = now;
+        }
+        
+        // Short delay before next loop iteration
+        vTaskDelay(50 / portTICK_PERIOD_MS);
+    } // End of while(true) loop
+} // END OF clockEngineTask
 
 // Disable homing required check for more reliable operation
 static void disable_homing_required() {
@@ -1198,9 +1441,13 @@ static void disable_homing_required() {
 
 // New function: Send multiple movements as a continuous sequence
 static void move_continuous_sequence(const float positions[][2], int num_positions, float speed_multipliers[]) {
+    // Input validation
+    if (num_positions <= 0 || num_positions > 20 || positions == NULL) {
+        debug_msg("ERROR: Invalid parameters to move_continuous_sequence");
+        return;
+    }
+    
     char cmd[64];
-    char buffer[1024] = {0};
-    int buffer_pos = 0;
     
     // Skip movement if disabled
     if (!movement_enabled) {
@@ -1211,48 +1458,64 @@ static void move_continuous_sequence(const float positions[][2], int num_positio
     // Store original settings to restore later
     float saved_accel = movement_accel;
     
-    // Set minimum viable acceleration (below 10 may not work properly)
+    // Set minimum viable acceleration
     float effect_accel = 10.0f;
     
-    // Set acceleration parameters
+    // CRITICAL: Wait for any ongoing movements to complete first
+    send_gcode("M400");
+    vTaskDelay(100 / portTICK_PERIOD_MS);
+    
+    // Set acceleration parameters with error checking
     memset(cmd, 0, sizeof(cmd));
     snprintf(cmd, sizeof(cmd)-1, "$120=%.2f", effect_accel);
-    send_gcode(cmd);
-    vTaskDelay(50 / portTICK_PERIOD_MS);
+    if (!send_gcode(cmd)) {
+        debug_msg("WARNING: Failed to set acceleration, continuing anyway");
+        // Don't retry - just continue with current settings
+    }
+    vTaskDelay(100 / portTICK_PERIOD_MS); // Longer delay
     
+    memset(cmd, 0, sizeof(cmd));
     snprintf(cmd, sizeof(cmd)-1, "$121=%.2f", effect_accel);
-    send_gcode(cmd);
-    vTaskDelay(50 / portTICK_PERIOD_MS);
+    if (!send_gcode(cmd)) {
+        debug_msg("WARNING: Failed to set acceleration, continuing anyway");
+        // Don't retry - just continue with current settings
+    }
+    vTaskDelay(100 / portTICK_PERIOD_MS); // Longer delay
     
     // Set jerk parameters
-    send_gcode("$J0=0.1");
-    vTaskDelay(50 / portTICK_PERIOD_MS);
-    send_gcode("$J1=0.1");
-    vTaskDelay(50 / portTICK_PERIOD_MS);
+    send_gcode("$J0=0.01");
+    vTaskDelay(100 / portTICK_PERIOD_MS);
+    send_gcode("$J1=0.01");
+    vTaskDelay(100 / portTICK_PERIOD_MS);
     
-    // Junction deviation
-    send_gcode("$11=0.01");
-    vTaskDelay(50 / portTICK_PERIOD_MS);
+    // Set junction deviation
+    send_gcode("$11=0.001");
+    vTaskDelay(100 / portTICK_PERIOD_MS);
     
     // Move to absolute position
     send_gcode("G90");
-    vTaskDelay(50 / portTICK_PERIOD_MS);
+    vTaskDelay(100 / portTICK_PERIOD_MS);
     
-    // Add movements to buffer
+    // Send all movements
     for (int i = 0; i < num_positions; i++) {
-        float feedrate = movement_speed * (speed_multipliers ? speed_multipliers[i] : 1.0f) * 60.0f;
+        float speed_factor = 1.0f;
+        if (speed_multipliers != NULL && i < num_positions) {
+            speed_factor = speed_multipliers[i];
+            if (speed_factor < 0.1f) speed_factor = 0.1f;
+            if (speed_factor > 5.0f) speed_factor = 5.0f;
+        }
         
-        // Send commands one at a time with short delays between
+        float feedrate = movement_speed * speed_factor * 60.0f;
+        
         memset(cmd, 0, sizeof(cmd));
         snprintf(cmd, sizeof(cmd)-1, "G1 X%.1f Y%.1f F%.1f", 
                 positions[i][0], positions[i][1], feedrate);
         send_gcode(cmd);
         
-        // Add a small delay between commands
-        vTaskDelay(20 / portTICK_PERIOD_MS);
+        vTaskDelay(50 / portTICK_PERIOD_MS);
     }
     
-    // Calculate total movement time and wait for completion
+    // Calculate total movement time
     float total_distance = 0;
     for (int i = 1; i < num_positions; i++) {
         float dx = positions[i][0] - positions[i-1][0];
@@ -1260,37 +1523,254 @@ static void move_continuous_sequence(const float positions[][2], int num_positio
         total_distance += sqrt(dx*dx + dy*dy);
     }
     
+    if (isnan(total_distance) || isinf(total_distance)) {
+        total_distance = 360.0f;
+    }
+    
     uint32_t movement_time_ms = (uint32_t)((total_distance / movement_speed) * 1000);
     movement_time_ms = (uint32_t)(movement_time_ms * movement_timeout_factor);
+    
     if (movement_time_ms < 1000) movement_time_ms = 1000;
+    if (movement_time_ms > 10000) movement_time_ms = 10000;
     
     debug_msg("Continuous movement started, waiting %d ms for completion", movement_time_ms);
     
-    // Wait for movement to complete
+    // Wait for movement to complete (BUT DON'T CHANGE SETTINGS DURING WAIT!)
     const uint32_t CHECK_INTERVAL = 100;
     uint32_t elapsed = 0;
+    uint32_t idle_count = 0;
     
     while (elapsed < movement_time_ms) {
         vTaskDelay(CHECK_INTERVAL / portTICK_PERIOD_MS);
         elapsed += CHECK_INTERVAL;
         
-        // Check if we're done early
+        // Check if done early
         if (sys.state == State::Idle) {
-            debug_msg("Continuous movement completed early");
-            break;
+            idle_count++;
+            if (idle_count >= 2) {
+                debug_msg("Movement completed early after %d ms", elapsed);
+                break;
+            }
+        } else {
+            idle_count = 0;
+        }
+        
+        // Extra protection against crashes during long waits
+        if (elapsed % 1000 == 0) {
+            vTaskDelay(20 / portTICK_PERIOD_MS);
         }
     }
     
-    // CRITICAL: Reset settings to original values
-    snprintf(cmd, sizeof(cmd)-1, "$120=%.2f", saved_accel);
-    send_gcode(cmd);
-    vTaskDelay(50 / portTICK_PERIOD_MS);
+    // IMPORTANT: Wait for all movement to complete before changing settings
+    send_gcode("M400");
+    vTaskDelay(200 / portTICK_PERIOD_MS);
     
+    // NOW restore settings AFTER movement is complete
+    memset(cmd, 0, sizeof(cmd));
+    snprintf(cmd, sizeof(cmd)-1, "$120=%.2f", saved_accel);
+    if (!send_gcode(cmd)) {
+        debug_msg("WARNING: Failed to restore acceleration, continuing anyway");
+        // Don't retry - just continue
+    }
+    vTaskDelay(100 / portTICK_PERIOD_MS);
+    
+    memset(cmd, 0, sizeof(cmd));
     snprintf(cmd, sizeof(cmd)-1, "$121=%.2f", saved_accel);
-    send_gcode(cmd);
-    vTaskDelay(50 / portTICK_PERIOD_MS);
+    if (!send_gcode(cmd)) {
+        debug_msg("WARNING: Failed to restore acceleration, continuing anyway");
+        // Don't retry - just continue
+    }
+    vTaskDelay(100 / portTICK_PERIOD_MS);
     
     debug_msg("Continuous movement complete");
+}
+
+// Move with continuous rotation, allowing angles beyond 360 degrees
+static void move_continuous_rotation(const float positions[][2], int num_positions, float speed_multipliers[]) {
+    // Input validation
+    if (num_positions <= 0 || num_positions > 50 || positions == NULL) {
+        debug_msg("ERROR: Invalid parameters to move_continuous_rotation");
+        return;
+    }
+    
+    char cmd[64];
+    
+    // Skip movement if disabled
+    if (!movement_enabled) {
+        debug_msg("Movement disabled - skipping continuous rotation");
+        return;
+    }
+    
+    // Store original settings to restore later
+    float saved_accel = movement_accel;
+    
+    // CRITICAL: Wait for any ongoing movements to complete first
+    send_gcode("M400");
+    vTaskDelay(200 / portTICK_PERIOD_MS);
+    
+    // Set minimum viable acceleration
+    float effect_accel = 10.0f;
+    
+    // Set acceleration parameters - with error checking and retries
+    for (int retry = 0; retry < 3; retry++) {
+        memset(cmd, 0, sizeof(cmd));
+        snprintf(cmd, sizeof(cmd)-1, "$120=%.2f", effect_accel);
+        if (send_gcode(cmd)) break;
+        debug_msg("Retry %d: Setting X acceleration", retry+1);
+        vTaskDelay(100 / portTICK_PERIOD_MS);
+    }
+    vTaskDelay(200 / portTICK_PERIOD_MS);
+    
+    for (int retry = 0; retry < 3; retry++) {
+        memset(cmd, 0, sizeof(cmd));
+        snprintf(cmd, sizeof(cmd)-1, "$121=%.2f", effect_accel);
+        if (send_gcode(cmd)) break;
+        debug_msg("Retry %d: Setting Y acceleration", retry+1);
+        vTaskDelay(100 / portTICK_PERIOD_MS);
+    }
+    vTaskDelay(200 / portTICK_PERIOD_MS);
+    
+    // Move to absolute position
+    send_gcode("G90");
+    vTaskDelay(200 / portTICK_PERIOD_MS);
+    
+    // Break the movement into smaller batches to prevent buffer overflow
+    const int BATCH_SIZE = 10;
+    int batches = (num_positions + BATCH_SIZE - 1) / BATCH_SIZE;
+    
+    debug_msg("Processing rotation in %d batches of max %d points", batches, BATCH_SIZE);
+    
+    for (int batch = 0; batch < batches; batch++) {
+        int start_idx = batch * BATCH_SIZE;
+        int end_idx = min(start_idx + BATCH_SIZE, num_positions);
+        
+        debug_msg("Processing rotation batch %d/%d (points %d-%d)", 
+                 batch+1, batches, start_idx, end_idx-1);
+        
+        // Wait for previous batch to complete before sending next batch
+        if (batch > 0) {
+            send_gcode("M400");
+            vTaskDelay(200 / portTICK_PERIOD_MS);
+        }
+        
+        // Process this batch of movements
+        for (int i = start_idx; i < end_idx; i++) {
+            // Safety check for speed_multipliers
+            float speed_factor = 1.0f;
+            if (speed_multipliers != NULL && i < num_positions) {
+                speed_factor = speed_multipliers[i];
+                if (speed_factor < 0.1f) speed_factor = 0.1f;
+                if (speed_factor > 5.0f) speed_factor = 5.0f;
+            }
+            
+            float feedrate = movement_speed * speed_factor * 60.0f;
+            
+            // Clamp positions to safe ranges for GRBL
+            // Most GRBL implementations have trouble with very large values
+            float target_x = positions[i][0];
+            float target_y = positions[i][1];
+            
+            // Send commands one at a time with short delays between
+            memset(cmd, 0, sizeof(cmd));
+            snprintf(cmd, sizeof(cmd)-1, "G1 X%.1f Y%.1f F%.1f", 
+                    target_x, target_y, feedrate);
+            
+            if (!send_gcode(cmd)) {
+                debug_msg("WARNING: Failed to send movement command for point %d", i);
+                vTaskDelay(200 / portTICK_PERIOD_MS);
+            }
+            
+            // Debug output only for a few points to reduce serial load
+            if (i % 5 == 0) {
+                debug_msg("Rotation point %d: X=%.1f Y=%.1f (Speed factor: %.1f)", 
+                         i, target_x, target_y, speed_factor);
+            }
+            
+            // Allow more time between commands
+            vTaskDelay(100 / portTICK_PERIOD_MS);
+        }
+        
+        // Allow time for this batch to process
+        vTaskDelay(500 / portTICK_PERIOD_MS);
+    }
+    
+    // Calculate maximum rotation from the input points
+    float max_revolution_count = 1.0f;  // Default minimum
+    for (int i = 0; i < num_positions; i++) {
+        float x_revs = fabs(positions[i][0]) / 360.0f;
+        float y_revs = fabs(positions[i][1]) / 360.0f;
+        if (x_revs > max_revolution_count) max_revolution_count = x_revs;
+        if (y_revs > max_revolution_count) max_revolution_count = y_revs;
+    }
+    
+    // Use calculated revolutions for timing with a more conservative estimate
+    uint32_t movement_time_ms = (uint32_t)(max_revolution_count * 360.0f / movement_speed * 1000 * 2.5f);
+    
+    // Ensure reasonable bounds for timeout
+    if (movement_time_ms < 3000) movement_time_ms = 3000;
+    if (movement_time_ms > 30000) movement_time_ms = 30000;
+    
+    debug_msg("Waiting %d ms for continuous rotation to complete", movement_time_ms);
+    
+    // Wait for movement to complete
+    const uint32_t CHECK_INTERVAL = 500; // Longer interval
+    uint32_t elapsed = 0;
+    uint32_t idle_count = 0;
+    
+    while (elapsed < movement_time_ms) {
+        vTaskDelay(CHECK_INTERVAL / portTICK_PERIOD_MS);
+        elapsed += CHECK_INTERVAL;
+        
+        // More frequent system state reporting
+        if (elapsed % 2000 == 0) {
+            debug_msg("Rotation progress: %d/%d ms, state: %d", 
+                     elapsed, movement_time_ms, (int)sys.state);
+        }
+        
+        // Check if we're done early
+        if (sys.state == State::Idle) {
+            idle_count++;
+            if (idle_count >= 2) {
+                debug_msg("Rotation completed early after %d ms", elapsed);
+                break;
+            }
+        } else {
+            idle_count = 0;
+        }
+    }
+    
+    // CRITICAL: Make absolutely sure movement is complete
+    send_gcode("M400");
+    vTaskDelay(500 / portTICK_PERIOD_MS);
+    
+    // Restore settings
+    memset(cmd, 0, sizeof(cmd));
+    snprintf(cmd, sizeof(cmd)-1, "$120=%.2f", saved_accel);
+    send_gcode(cmd);
+    vTaskDelay(200 / portTICK_PERIOD_MS);
+    
+    memset(cmd, 0, sizeof(cmd));
+    snprintf(cmd, sizeof(cmd)-1, "$121=%.2f", saved_accel);
+    send_gcode(cmd);
+    vTaskDelay(200 / portTICK_PERIOD_MS);
+    
+    // Normalize final position
+    float final_x = positions[num_positions-1][0];
+    float final_y = positions[num_positions-1][1];
+    
+    // Convert to normalized angles (0-360°)
+    while (final_x < 0) final_x += 360.0f;
+    while (final_x >= 360.0f) final_x -= 360.0f;
+    while (final_y < 0) final_y += 360.0f;
+    while (final_y >= 360.0f) final_y -= 360.0f;
+    
+    // Force the final position
+    memset(cmd, 0, sizeof(cmd));
+    snprintf(cmd, sizeof(cmd)-1, "G92 X%.1f Y%.1f", final_x, final_y);
+    send_gcode(cmd);
+    vTaskDelay(200 / portTICK_PERIOD_MS);
+    
+    debug_msg("Continuous rotation complete");
 }
 
 // Get the current position (angles) of the clock hands
@@ -1303,6 +1783,17 @@ static void get_current_position(float &x, float &y) {
     x = machine_position[X_AXIS];
     y = machine_position[Y_AXIS];
     
+    // Error checking for NaN/infinity
+    if (isnan(x) || isinf(x)) {
+        debug_msg("WARNING: Invalid X position detected, using fallback");
+        x = 0.0f;
+    }
+    
+    if (isnan(y) || isinf(y)) {
+        debug_msg("WARNING: Invalid Y position detected, using fallback");
+        y = 0.0f;
+    }
+    
     // Ensure angles are within 0-360 range
     while (x < 0) x += 360.0f;
     while (x >= 360) x -= 360.0f;
@@ -1310,6 +1801,147 @@ static void get_current_position(float &x, float &y) {
     while (y >= 360) y -= 360.0f;
 }
 
+// Add this function to periodically verify position
+static void verify_and_correct_time_position() {
+    // 1. Get what the current time angles SHOULD be
+    float expected_hour_angle, expected_minute_angle;
+    time_to_angles(current_hour, current_minute, expected_hour_angle, expected_minute_angle);
+    
+    // 2. Get what the controller THINKS the current position is
+    float current_min_angle, current_hour_angle;
+    get_current_position(current_min_angle, current_hour_angle);
+    
+    // 3. Check if there's significant drift (more than 2 degrees)
+    float minute_diff = fabs(expected_minute_angle - current_min_angle);
+    float hour_diff = fabs(expected_hour_angle - current_hour_angle);
+    
+    // Handle wraparound at 360 degrees
+    if (minute_diff > 180.0f) minute_diff = 360.0f - minute_diff;
+    if (hour_diff > 180.0f) hour_diff = 360.0f - hour_diff;
+    
+    if (minute_diff > 2.0f || hour_diff > 2.0f) {
+        debug_msg("Position drift detected: Minute: %.1f° (vs %.1f°), Hour: %.1f° (vs %.1f°)", 
+                 current_min_angle, expected_minute_angle, 
+                 current_hour_angle, expected_hour_angle);
+        
+        // 4. First move to the correct position physically
+        movement_speed = 60.0f; // Slow, deliberate movement
+        move_to_angles(expected_minute_angle, expected_hour_angle);
+        vTaskDelay(1000 / portTICK_PERIOD_MS); // Wait for movement to complete
+        
+        // 5. Then ensure the coordinate system matches
+        char cmd[64];
+        memset(cmd, 0, sizeof(cmd));
+        snprintf(cmd, sizeof(cmd)-1, "G92 X%.1f Y%.1f", 
+ 
+                 expected_minute_angle, expected_hour_angle);
+        send_gcode(cmd);
+        vTaskDelay(200 / portTICK_PERIOD_MS);
+        
+        debug_msg("Position re-synchronized to match current time");
+    }
+}
 
+// Move this function definition OUTSIDE of clockEngineTask
+bool gcode_unknown_command_execute(char *line) {
+    // Check for CLOCK commands
+    if (strncmp(line, "CLOCK", 5) == 0) {
+        // Extract command after CLOCK prefix
+        char* cmd = line + 5;
+        while (*cmd == ' ') cmd++; // Skip spaces
+        
+        if (strncmp(cmd, "REHOME", 6) == 0) {
+            rehome_clock();
+            return true;
+        }
+        
+        // Add the DEBUG command handler here too, inside the CLOCK check
+        if (strncmp(cmd, "DEBUG", 5) == 0) {
+            char* level = cmd + 5;
+            while (*level == ' ') level++; // Skip spaces
+            
+            int debugLevel = atoi(level);
+            if (debugLevel >= DEBUG_MINIMAL && debugLevel <= DEBUG_VERBOSE) {
+                active_debug_level = (DebugLevel)debugLevel;
+                debug_msg("Debug level set to %d", active_debug_level);
+            } else {
+                debug_msg("Invalid debug level: %d (valid: 0-2)", debugLevel);
+            }
+            return true;
+        }
+    }
+    
+    return false;
+}
 
-
+// Add this function to do a complete rehoming sequence
+void rehome_clock() {
+    debug_msg("Starting complete rehoming sequence");
+    
+    // Ensure system is unlocked
+    send_gcode("$X");
+    vTaskDelay(1000 / portTICK_PERIOD_MS);
+    
+    // First move to a safe position to avoid limit switch crashes
+    debug_msg("Moving to safe position before homing");
+    send_gcode("G90");  // Absolute positioning
+    vTaskDelay(100 / portTICK_PERIOD_MS);
+    send_gcode("G1 X180 Y180 F10800");  // Move to 6:00 position slowly
+    vTaskDelay(3000 / portTICK_PERIOD_MS);
+    
+    // Home hour hand (Y axis) first
+    debug_msg("Homing hour hand (Y axis)");
+    mc_homing_cycle(0x2);  // Home Y axis
+    
+    // Wait for homing to complete with timeout
+    uint32_t timeout = millis() + 15000;
+    while (sys.state != State::Idle && millis() < timeout) {
+        vTaskDelay(100 / portTICK_PERIOD_MS);
+    }
+    
+    if (sys.state != State::Idle) {
+        debug_msg("WARNING: Y homing timed out, attempting recovery");
+        send_gcode("$X");
+        vTaskDelay(1000 / portTICK_PERIOD_MS);
+    } else {
+        debug_msg("Y axis homing complete");
+    }
+    
+    // Then home minute hand (X axis)
+    debug_msg("Homing minute hand (X axis)");
+    mc_homing_cycle(0x1);  // Home X axis
+    
+    // Wait for homing to complete
+    timeout = millis() + 15000;
+    while (sys.state != State::Idle && millis() < timeout) {
+        vTaskDelay(100 / portTICK_PERIOD_MS);
+    }
+    
+    if (sys.state != State::Idle) {
+        debug_msg("WARNING: X homing timed out, attempting recovery");
+        send_gcode("$X");
+        vTaskDelay(1000 / portTICK_PERIOD_MS);
+    } else {
+        debug_msg("X axis homing complete");
+    }
+    
+    // Move to 12:00 position after homing
+    debug_msg("Moving to 12:00 position after homing");
+    send_gcode("G1 X0 Y0 F3600");  // Slow, controlled movement
+    vTaskDelay(3000 / portTICK_PERIOD_MS);
+    
+    // Update system status
+    initial_homing_done = true;
+    
+    // Update current time from RTC if available
+    if (rtc_initialized) {
+        update_time_from_rtc();
+        debug_msg("Clock rehomed and synchronized to %02d:%02d", 
+                 current_hour, current_minute);
+    } else {
+        debug_msg("Clock rehomed (RTC not available)");
+    }
+    
+    // Verify position matches current time
+    verify_and_correct_time_position();
+}
