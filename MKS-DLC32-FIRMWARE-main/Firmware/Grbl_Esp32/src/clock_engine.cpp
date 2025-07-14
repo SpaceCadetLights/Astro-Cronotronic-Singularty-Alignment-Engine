@@ -115,7 +115,7 @@ typedef struct {
 } SequenceStep;
 
 // Define the sequence steps
-#define MAX_SEQUENCE_STEPS 6  // Reduced to 3 steps
+#define MAX_SEQUENCE_STEPS 11  // Reduced to 3 steps
 
 // Comment out the current sequence
 
@@ -125,18 +125,33 @@ static SequenceStep sequence[MAX_SEQUENCE_STEPS] = {
     
     // Play pendulum animation
     {MODE_PENDULUM, 0, 0, 0, 0, "", 100},
+
+    // Play 11:11 animation
+    {MODE_SPECIFIC_TIME, 11, 11, 0, 0, "", 15000},
+
+    {MODE_PENDULUM, 0, 0, 0, 0, "", 100},
+
+    // Show current time for 10 seconds
+    {MODE_CURRENT_TIME, 0, 0, 0, 0, "", 10000},
     
-    // Play rewind animation
-    {MODE_REWIND, 0, 0, 0, 0, "", 100},
     
     // Play 11:11 animation
-    {MODE_MOVE_TO_1111, 0, 0, 0, 0, "", 100},
+    {MODE_SPECIFIC_TIME, 4, 20, 0, 0, "", 10000},
+
+    // Show current time for 10 seconds
+    {MODE_CURRENT_TIME, 0, 0, 0, 0, "", 10000},
     
-    // Play 4:20 animation
-    {MODE_MOVE_TO_420, 0, 0, 0, 0, "", 100},
+    // Play 11:11 animation
+    {MODE_SPECIFIC_TIME, 2, 22, 0, 0, "", 10000},
+
+    // Show current time for 10 seconds
+    {MODE_CURRENT_TIME, 0, 0, 0, 0, "", 10000},
     
-    // Return to current time for 10 seconds
-    {MODE_CURRENT_TIME, 0, 0, 0, 0, "", 10000}
+    // Play 11:11 animation
+    {MODE_SPECIFIC_TIME, 3, 33, 0, 0, "", 5000},
+
+    {MODE_PENDULUM, 0, 0, 0, 0, "", 100},
+    
 };
 
 
@@ -894,16 +909,16 @@ static void play_rewind_animation() {
         vTaskDelay(200 / portTICK_PERIOD_MS);
     }
     
-    // Ensure we're at the correct normalized position
-    send_gcode("G92 X0 Y0");
-    vTaskDelay(200 / portTICK_PERIOD_MS);
+    // // Ensure we're at the correct normalized position
+    // send_gcode("G92 X0 Y0");
+    // vTaskDelay(200 / portTICK_PERIOD_MS);
     
-    // Now set to the real angle
-    memset(cmd, 0, sizeof(cmd));
-    snprintf(cmd, sizeof(cmd)-1, "G92 X%.1f Y%.1f", 
-             original_minute_angle, original_hour_angle);
-    send_gcode(cmd);
-    vTaskDelay(200 / portTICK_PERIOD_MS);
+    // // Now set to the real angle
+    // memset(cmd, 0, sizeof(cmd));
+    // snprintf(cmd, sizeof(cmd)-1, "G92 X%.1f Y%.1f", 
+    //          original_minute_angle, original_hour_angle);
+    // send_gcode(cmd);
+    // vTaskDelay(200 / portTICK_PERIOD_MS);
     
     // Restore original speed
     movement_speed = saved_speed;
@@ -1004,7 +1019,7 @@ static void advance_sequence() {
         case MODE_CURRENT_TIME:
             debug_msg("Sequence: Showing current time");
             display_time(current_hour, current_minute);
-            verify_and_correct_time_position(); // Add this line
+            //verify_and_correct_time_position(); // Add this line
             break;
             
         case MODE_SPECIFIC_TIME:
@@ -1377,7 +1392,8 @@ void clockEngineTask(void* parameter) {
                 vTaskDelay(100 / portTICK_PERIOD_MS);
                 send_gcode("M400"); // Wait for moves to complete
                 vTaskDelay(100 / portTICK_PERIOD_MS);
-                send_gcode("G92 X0 Y0"); // Force position reset
+                //send_gcode("G92 X0 Y0"); // Force position reset
+                rehome_clock(); // Rehome the clock hands
                 vTaskDelay(100 / portTICK_PERIOD_MS);
                 
                 // Force garbage collection and memory reset
@@ -1403,8 +1419,8 @@ void clockEngineTask(void* parameter) {
         static uint32_t last_position_check = 0;
         if (now - last_position_check > 300000) { // Every 5 minutes
             if (current_mode == MODE_CURRENT_TIME && sys.state == State::Idle) {
-                debug_msg("Performing periodic position verification");
-                verify_and_correct_time_position();
+                //debug_msg("Performing periodic position verification");
+                //verify_and_correct_time_position();
             }
             last_position_check = now;
         }
@@ -1434,9 +1450,9 @@ static void disable_homing_required() {
     // Also unlock and soft-home for good measure
     send_gcode("$X");
     vTaskDelay(100 / portTICK_PERIOD_MS);
-    send_gcode("G92 X0 Y0");
-    vTaskDelay(100 / portTICK_PERIOD_MS);
-    debug_msg("Soft homing performed");
+    //send_gcode("G92 X0 Y0");
+    //vTaskDelay(100 / portTICK_PERIOD_MS);
+    //debug_msg("Soft homing performed");
 }
 
 // New function: Send multiple movements as a continuous sequence
@@ -1764,11 +1780,11 @@ static void move_continuous_rotation(const float positions[][2], int num_positio
     while (final_y < 0) final_y += 360.0f;
     while (final_y >= 360.0f) final_y -= 360.0f;
     
-    // Force the final position
-    memset(cmd, 0, sizeof(cmd));
-    snprintf(cmd, sizeof(cmd)-1, "G92 X%.1f Y%.1f", final_x, final_y);
-    send_gcode(cmd);
-    vTaskDelay(200 / portTICK_PERIOD_MS);
+    // // Force the final position
+    // memset(cmd, 0, sizeof(cmd));
+    // snprintf(cmd, sizeof(cmd)-1, "G92 X%.1f Y%.1f", final_x, final_y);
+    // send_gcode(cmd);
+    // vTaskDelay(200 / portTICK_PERIOD_MS);
     
     debug_msg("Continuous rotation complete");
 }
@@ -1943,5 +1959,5 @@ void rehome_clock() {
     }
     
     // Verify position matches current time
-    verify_and_correct_time_position();
+    //verify_and_correct_time_position();
 }
