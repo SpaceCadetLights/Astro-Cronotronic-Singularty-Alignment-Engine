@@ -30,16 +30,23 @@ static bool send_gcode(const char *line);
 // Forward declaration for disable_homing_required function
 static void disable_homing_required();
 
+// Forward declaration for continuous movement function
+static void move_continuous_sequence(const float positions[][2], int num_positions, float speed_multipliers[]);
+
+// Forward declaration for getting current position
+static void get_current_position(float &x, float &y);
+
 // Movement control flag - set to false to disable all physical movement
 static bool movement_enabled = true;
 
-// Movement speed in degrees per second (1-100 range)
-// Lower values = slower movement
-static float movement_speed = 30.0f;  // 30 degrees per second default
+// Movement speed in degrees per second (1-180 range)
+// Higher values = faster movement
+static float movement_speed = 180.0f;  // Increased from 30 to 180 for snappier movement
 
-// Movement acceleration in degrees per second^2 (100-1000 range)
-// Lower values = gentler acceleration/deceleration
-static float movement_accel = 300.0f; // Default acceleration
+// Change the default acceleration to 0.5 (supports lower values now)
+// Movement acceleration in degrees per second^2 (0.1-1000 range)
+// EXTREMELY low values = ultra-fluid movement that never reaches constant speed
+static float movement_accel = 0.5f; // Default to 0.5 for ultra-fluid motion
 
 // Movement timeout multiplier - extends wait time for movements
 // Higher values give more time for movements to complete
@@ -54,7 +61,8 @@ enum ClockMode {
     MODE_CURRENT_TIME = 0,  // Show the current time
     MODE_SPECIFIC_TIME,     // Show a specific time
     MODE_PLAY_FILE,         // Play a G-code file
-    MODE_DIRECT_ANGLE       // Move to specific angles
+    MODE_DIRECT_ANGLE,      // Move to specific angles
+    MODE_PENDULUM           // Pendulum animation
 };
 
 // Current operation mode
@@ -83,29 +91,16 @@ typedef struct {
 } SequenceStep;
 
 // Define the sequence steps
-#define MAX_SEQUENCE_STEPS 10
+#define MAX_SEQUENCE_STEPS 3  // We only need 3 steps now
 static SequenceStep sequence[MAX_SEQUENCE_STEPS] = {
-    // Time sequence
-    {MODE_SPECIFIC_TIME, 12, 0, 0, 0, "", 5000},             // Noon
-    {MODE_SPECIFIC_TIME, 4, 20, 0, 0, "", 5000},             // 4:20
-    {MODE_SPECIFIC_TIME, 7, 7, 0, 0, "", 5000},              // 7:07
+    // Show current time for 10 seconds
+    {MODE_CURRENT_TIME, 0, 0, 0, 0, "", 10000},
     
-    // Cosmic alignment (using direct angles)
-    {MODE_DIRECT_ANGLE, 0, 0, 180, 180, "", 5000},           // Hands aligned at 6:00
-    {MODE_DIRECT_ANGLE, 0, 0, 90, 270, "", 5000},            // Perpendicular hands (3:00/9:00)
+    // Play pendulum animation
+    {MODE_PENDULUM, 0, 0, 0, 0, "", 100},
     
-    // Playful patterns
-    {MODE_PLAY_FILE, 0, 0, 0, 0, "spin420.nc", 0},           // Play G-code file
-    
-    // Mystical times
-    {MODE_SPECIFIC_TIME, 11, 11, 0, 0, "", 5000},            // 11:11
-    {MODE_SPECIFIC_TIME, 12, 34, 0, 0, "", 5000},            // 12:34
-    
-    // Kaleidoscope effect
-    {MODE_DIRECT_ANGLE, 0, 0, 45, 315, "", 5000},            // 1:30/10:30
-    
-    // Return to current time
-    {MODE_CURRENT_TIME, 0, 0, 0, 0, "", 15000}               // Current time
+    // Return to current time for 10 seconds
+    {MODE_CURRENT_TIME, 0, 0, 0, 0, "", 10000}
 };
 
 // Sequence tracking variables
@@ -220,9 +215,6 @@ static void set_rtc_time(int hour, int minute) {
 //===================================
 // UTILITY FUNCTIONS
 //===================================
-
-// Forward declaration of the position function
-static void get_current_position(float &x, float &y);
 
 // Function to send G-code commands
 static bool send_gcode(const char *line) {
@@ -414,14 +406,28 @@ static void move_to_angles(float minute_angle, float hour_angle) {
         return;
     }
     
-    // Set acceleration
+    // Set very low acceleration for ultra-fluid motion
     memset(cmd, 0, sizeof(cmd));
-    snprintf(cmd, sizeof(cmd)-1, "$120=%.1f", movement_accel);
+    // Convert ultra-low values to the minimum GRBL will accept
+    float effective_accel = (movement_accel < 1.0f) ? 
+                            (1.0f + (movement_accel * 4.0f)) : // Map 0.1-1.0 to 1.4-5.0
+                            movement_accel;
+    snprintf(cmd, sizeof(cmd)-1, "$120=%.2f", effective_accel);
     send_gcode(cmd);
     vTaskDelay(50 / portTICK_PERIOD_MS);
     
-    snprintf(cmd, sizeof(cmd)-1, "$121=%.1f", movement_accel);
+    snprintf(cmd, sizeof(cmd)-1, "$121=%.2f", effective_accel);
     send_gcode(cmd);
+    vTaskDelay(50 / portTICK_PERIOD_MS);
+    
+    // Set jerk to the absolute minimum possible
+    send_gcode("$J0=0.01"); // X jerk absolute minimum
+    vTaskDelay(50 / portTICK_PERIOD_MS);
+    send_gcode("$J1=0.01"); // Y jerk absolute minimum
+    vTaskDelay(50 / portTICK_PERIOD_MS);
+    
+    // Set very low junction deviation for smooth corners
+    send_gcode("$11=0.001");
     vTaskDelay(50 / portTICK_PERIOD_MS);
     
     // Move to absolute position
@@ -488,6 +494,71 @@ static void play_gcode_file(const char* filename) {
     }
 }
 
+// Pendulum animation - makes clock hands fall with gravity and swing
+// Updated pendulum animation without stopping at 6:00 position
+static void play_pendulum_animation() {
+    debug_msg("Playing pendulum animation");
+    
+    // Store current time for returning later
+    float original_hour_angle, original_minute_angle;
+    time_to_angles(current_hour, current_minute, original_hour_angle, original_minute_angle);
+    
+    // Save current movement parameters
+    float saved_speed = movement_speed;
+    float saved_accel = movement_accel;
+    
+    // Use very slow acceleration for all movements
+    movement_accel = 0.5f; // Ultra-low for fluid motion
+    
+    // Create a single combined position array for the entire animation
+    // This creates a continuous movement from time to full pendulum animation
+    float pendulum_positions[][2] = {
+        {original_minute_angle, original_hour_angle},         // Start at current time
+        {original_minute_angle + 10, original_hour_angle + 10}, // Slight initial droop
+        {180, 180},                                           // Fall to 6:00
+        {205, 205},                                           // First left swing
+        {155, 155},                                           // First right swing
+        {195, 195},                                           // Second left swing
+        {165, 165},                                           // Second right swing
+        {188, 188},                                           // Third left swing 
+        {172, 172},                                           // Third right swing
+        {183, 183},                                           // Tiny left swing
+        {180, 180},                                           // Final settling at 6:00
+        {160, 160},                                           // Wake-up jolt
+        {original_minute_angle, original_hour_angle}          // Return to original time
+    };
+    
+    // Speed multipliers for natural physics-based motion
+    float pendulum_speeds[] = {
+        0.5f,   // Initial droop (slow)
+        3.0f,   // Fast fall to 6:00
+        2.4f,   // Fast first left swing
+        2.1f,   // First right swing
+        1.8f,   // Second left swing
+        1.5f,   // Second right swing
+        1.2f,   // Third left swing
+        0.9f,   // Third right swing
+        0.6f,   // Tiny left swing
+        0.3f,   // Final settling
+        1.5f,   // Wake-up jolt
+        3.0f,   // Fast return to original time (increased from 2.8)
+        3.0f    // Keep same high speed for final position
+    };
+    
+    // Short dramatic pause before starting
+    vTaskDelay(300 / portTICK_PERIOD_MS);
+    
+    // Execute the complete animation as one continuous movement
+    movement_speed = 220.0f; // Increased from 180.0f for more snappy movement
+    move_continuous_sequence(pendulum_positions, 13, pendulum_speeds);
+    
+    // Restore original speed settings
+    movement_speed = saved_speed;
+    movement_accel = saved_accel;
+    
+    debug_msg("Pendulum animation complete");
+}
+
 // Move to the next step in the sequence
 static void advance_sequence() {
     // Move to the next step, wrapping around if needed
@@ -531,6 +602,13 @@ static void advance_sequence() {
             debug_msg("Sequence: Moving to angles X%.1f Y%.1f", 
                       target_minute_angle, target_hour_angle);
             move_to_angles(target_minute_angle, target_hour_angle);
+            break;
+            
+        case MODE_PENDULUM:
+            debug_msg("Sequence: Starting pendulum animation");
+            play_pendulum_animation();
+            // Immediately advance to next step after animation completes
+            advance_sequence();
             break;
     }
 }
@@ -648,9 +726,9 @@ void clockEngineTask(void* parameter) {
             debug_msg("Moving hands to show system is active (at reduced speed)");
             movement_enabled = true; // Force movement on
             move_to_angles(180, 180); // Move to 3:00/9:00 position (perpendicular)
-            vTaskDelay(2000 / portTICK_PERIOD_MS); // 2 seconds between movements
+            vTaskDelay(50 / portTICK_PERIOD_MS); // 2 seconds between movements
             move_to_angles(0, 0); // Move to 6:00 position (aligned)
-            vTaskDelay(2000 / portTICK_PERIOD_MS); // 2 seconds between movements
+            vTaskDelay(50 / portTICK_PERIOD_MS); // 2 seconds between movements
             debug_msg("Initial movement test complete, continuing with homing");
         }
         
@@ -699,14 +777,22 @@ void clockEngineTask(void* parameter) {
             float saved_speed = movement_speed;
             movement_speed = 45.0f; // fast speed for testing
             
-            // Test HOUR hand (Y axis) - moving to 4 cardinal positions
+            // Test HOUR hand (Y axis) - with ultra-fluid motion
             debug_msg("Testing HOUR hand (Y axis)");
+            movement_speed = 150.0f;
+            movement_accel = 6.0f;  // Was 30.0f (5x reduction)
             move_to_angles(0, 90);    // Hour hand at 3:00
             vTaskDelay(500 / portTICK_PERIOD_MS);
+            movement_speed = 120.0f;
+            movement_accel = 5.0f;  // Was 25.0f (5x reduction)
             move_to_angles(0, 180);   // Hour hand at 6:00
             vTaskDelay(500 / portTICK_PERIOD_MS);
+            movement_speed = 180.0f;
+            movement_accel = 4.0f;  // Was 20.0f (5x reduction)
             move_to_angles(0, 270);   // Hour hand at 9:00
             vTaskDelay(500 / portTICK_PERIOD_MS);
+            movement_speed = 210.0f;
+            movement_accel = 7.0f;  // Was 35.0f (5x reduction)
             move_to_angles(0, 0);     // Hour hand at 12:00
             vTaskDelay(1000 / portTICK_PERIOD_MS);
             
@@ -742,6 +828,8 @@ void clockEngineTask(void* parameter) {
         if (system_ready && initial_homing_done) {
             // Check if we need to advance to the next sequence step
             SequenceStep *current_step = &sequence[current_sequence_step];
+            
+    
             
             if (sequence_active && 
                 current_step->duration_ms > 0 && 
@@ -841,6 +929,10 @@ void clock_set_mode(int mode) {
             
         case MODE_DIRECT_ANGLE:
             move_to_angles(target_minute_angle, target_hour_angle);
+            break;
+            
+        case MODE_PENDULUM:
+            play_pendulum_animation();
             break;
     }
 }
@@ -1104,18 +1196,120 @@ static void disable_homing_required() {
     debug_msg("Soft homing performed");
 }
 
-// Helper function to get current position
-static void get_current_position(float &x, float &y) {
-    // Default to 0,0 if we can't get position
-    x = 0.0f;
-    y = 0.0f;
+// New function: Send multiple movements as a continuous sequence
+static void move_continuous_sequence(const float positions[][2], int num_positions, float speed_multipliers[]) {
+    char cmd[64];
+    char buffer[1024] = {0};
+    int buffer_pos = 0;
     
-    // Check if we're in a state where we can query position
-    if (sys.state == State::Idle) {
-        // Get position from motor steps (converted to mm)
-        x = gc_state.position[X_AXIS];
-        y = gc_state.position[Y_AXIS];
+    // Skip movement if disabled
+    if (!movement_enabled) {
+        debug_msg("Movement disabled - skipping continuous sequence");
+        return;
     }
+    
+    // Store original settings to restore later
+    float saved_accel = movement_accel;
+    
+    // Set minimum viable acceleration (below 10 may not work properly)
+    float effect_accel = 10.0f;
+    
+    // Set acceleration parameters
+    memset(cmd, 0, sizeof(cmd));
+    snprintf(cmd, sizeof(cmd)-1, "$120=%.2f", effect_accel);
+    send_gcode(cmd);
+    vTaskDelay(50 / portTICK_PERIOD_MS);
+    
+    snprintf(cmd, sizeof(cmd)-1, "$121=%.2f", effect_accel);
+    send_gcode(cmd);
+    vTaskDelay(50 / portTICK_PERIOD_MS);
+    
+    // Set jerk parameters
+    send_gcode("$J0=0.1");
+    vTaskDelay(50 / portTICK_PERIOD_MS);
+    send_gcode("$J1=0.1");
+    vTaskDelay(50 / portTICK_PERIOD_MS);
+    
+    // Junction deviation
+    send_gcode("$11=0.01");
+    vTaskDelay(50 / portTICK_PERIOD_MS);
+    
+    // Move to absolute position
+    send_gcode("G90");
+    vTaskDelay(50 / portTICK_PERIOD_MS);
+    
+    // Add movements to buffer
+    for (int i = 0; i < num_positions; i++) {
+        float feedrate = movement_speed * (speed_multipliers ? speed_multipliers[i] : 1.0f) * 60.0f;
+        
+        // Send commands one at a time with short delays between
+        memset(cmd, 0, sizeof(cmd));
+        snprintf(cmd, sizeof(cmd)-1, "G1 X%.1f Y%.1f F%.1f", 
+                positions[i][0], positions[i][1], feedrate);
+        send_gcode(cmd);
+        
+        // Add a small delay between commands
+        vTaskDelay(20 / portTICK_PERIOD_MS);
+    }
+    
+    // Calculate total movement time and wait for completion
+    float total_distance = 0;
+    for (int i = 1; i < num_positions; i++) {
+        float dx = positions[i][0] - positions[i-1][0];
+        float dy = positions[i][1] - positions[i-1][1];
+        total_distance += sqrt(dx*dx + dy*dy);
+    }
+    
+    uint32_t movement_time_ms = (uint32_t)((total_distance / movement_speed) * 1000);
+    movement_time_ms = (uint32_t)(movement_time_ms * movement_timeout_factor);
+    if (movement_time_ms < 1000) movement_time_ms = 1000;
+    
+    debug_msg("Continuous movement started, waiting %d ms for completion", movement_time_ms);
+    
+    // Wait for movement to complete
+    const uint32_t CHECK_INTERVAL = 100;
+    uint32_t elapsed = 0;
+    
+    while (elapsed < movement_time_ms) {
+        vTaskDelay(CHECK_INTERVAL / portTICK_PERIOD_MS);
+        elapsed += CHECK_INTERVAL;
+        
+        // Check if we're done early
+        if (sys.state == State::Idle) {
+            debug_msg("Continuous movement completed early");
+            break;
+        }
+    }
+    
+    // CRITICAL: Reset settings to original values
+    snprintf(cmd, sizeof(cmd)-1, "$120=%.2f", saved_accel);
+    send_gcode(cmd);
+    vTaskDelay(50 / portTICK_PERIOD_MS);
+    
+    snprintf(cmd, sizeof(cmd)-1, "$121=%.2f", saved_accel);
+    send_gcode(cmd);
+    vTaskDelay(50 / portTICK_PERIOD_MS);
+    
+    debug_msg("Continuous movement complete");
 }
+
+// Get the current position (angles) of the clock hands
+static void get_current_position(float &x, float &y) {
+    // Get current position from GRBL system
+    float machine_position[N_AXIS];
+    system_convert_array_steps_to_mpos(machine_position, sys_position);
+    
+    // X = Minute hand angle, Y = Hour hand angle
+    x = machine_position[X_AXIS];
+    y = machine_position[Y_AXIS];
+    
+    // Ensure angles are within 0-360 range
+    while (x < 0) x += 360.0f;
+    while (x >= 360) x -= 360.0f;
+    while (y < 0) y += 360.0f;
+    while (y >= 360) y -= 360.0f;
+}
+
+
 
 
