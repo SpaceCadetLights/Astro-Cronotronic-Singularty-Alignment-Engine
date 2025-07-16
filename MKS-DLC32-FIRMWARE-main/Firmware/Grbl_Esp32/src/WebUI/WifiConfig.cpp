@@ -413,6 +413,18 @@ namespace WebUI {
         if (SSID.length() == 0) {
             SSID = DEFAULT_AP_SSID;
         }
+        
+        // Get MAC address and add it to SSID
+        uint8_t mac[6];
+        WiFi.macAddress(mac);
+        String uniqueSSID = SSID + "_";
+        // Only use last 4 characters of MAC to keep the name short
+        uniqueSSID += String(mac[4], HEX);
+        uniqueSSID += String(mac[5], HEX);
+        // Convert to uppercase for better readability
+        uniqueSSID.toUpperCase();
+        // Use the unique SSID instead of the original one
+        SSID = uniqueSSID;
 
         String password = wifi_ap_password->get();
 

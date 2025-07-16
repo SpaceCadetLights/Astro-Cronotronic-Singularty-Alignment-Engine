@@ -29,6 +29,7 @@
 static float clock_position_offset = 45.0f;
 
 
+
 // Debug level configuration
 enum DebugLevel {
     DEBUG_MINIMAL = 0,   // Only essential messages
@@ -191,7 +192,7 @@ static SequenceStep sequence[MAX_SEQUENCE_STEPS] = {
     {MODE_SPECIFIC_TIME, 11, 56, 0, 0, "", 2000},
 
     // Play 11:11 animation
-    {MODE_SPECIFIC_TIME, 11, 57, 0, 0, "", 10000},
+    {MODE_SPECIFIC_TIME, 11, 57, 0, 0, "", 2000},
 
     {MODE_SPECIFIC_TIME, 11, 58, 0, 0, "", 2000},
 
@@ -212,9 +213,6 @@ static SequenceStep sequence[MAX_SEQUENCE_STEPS] = {
     {MODE_CURRENT_TIME, 0, 0, 0, 0, "", 15000},
 
     {MODE_PENDULUM, 0, 0, 0, 0, "", 100},
-
-    // Play 11:11 animation
-    {MODE_DIRECT_ANGLE, 0, 0, 180.0f, 270.0f, "", 10000},
 
     // Play wave animation
     {MODE_WAVE, 0, 0, 0, 0, "", 0},
@@ -1455,8 +1453,19 @@ void clockEngineTask(void* parameter) {
             
             // Finally, move both hands to starting position
             debug_msg("Moving both hands to 12:00 position");
-            move_to_angles(0, 0);     // Both hands at 12:00
+            move_to_angles(clock_position_offset, clock_position_offset); // Move to 12:00 with offset
             vTaskDelay(1000 / portTICK_PERIOD_MS);
+            
+            // Add alignment pause - 45 seconds at 12:00
+            debug_msg("ALIGNMENT PAUSE: Clock at 12:00 for 45 seconds");
+            debug_msg("Please manually align clock hands if needed");
+            for (int i = 45; i > 0; i--) {
+                if (i % 5 == 0 || i <= 5) {  // Show countdown every 5 seconds and for last 5 seconds
+                    debug_msg("Alignment time remaining: %d seconds", i);
+                }
+                vTaskDelay(1000 / portTICK_PERIOD_MS);
+            }
+            debug_msg("Alignment period complete, starting normal operation");
             
             // Restore normal speed
             movement_speed = saved_speed;
