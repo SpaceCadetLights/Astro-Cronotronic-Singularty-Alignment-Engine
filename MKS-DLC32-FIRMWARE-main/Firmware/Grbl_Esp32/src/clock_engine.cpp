@@ -23,6 +23,12 @@
 //===================================
 
 
+// Add this near line 45, with the other configuration variables
+// Position offset - allows rotating the entire clock face (in degrees)
+// Set to 0 for standard 12:00 position, or any value (e.g., 45) for offset positioning
+static float clock_position_offset = 45.0f;
+
+
 // Debug level configuration
 enum DebugLevel {
     DEBUG_MINIMAL = 0,   // Only essential messages
@@ -86,7 +92,8 @@ enum ClockMode {
     MODE_PENDULUM,          // Pendulum animation
     MODE_REWIND,            // Continuous backward rotation effect
     MODE_MOVE_TO_1111,      // Move to 11:11 and back
-    MODE_MOVE_TO_420        // Move to 4:20 and back
+    MODE_MOVE_TO_420,       // Move to 4:20 and back
+    MODE_WAVE              // Wave animation (hands oscillate like waving)
 };
 
 // Current operation mode
@@ -115,7 +122,7 @@ typedef struct {
 } SequenceStep;
 
 // Define the sequence steps
-#define MAX_SEQUENCE_STEPS 11  // Reduced to 3 steps
+#define MAX_SEQUENCE_STEPS 34  // Reduced to 3 steps
 
 // Comment out the current sequence
 
@@ -123,34 +130,95 @@ static SequenceStep sequence[MAX_SEQUENCE_STEPS] = {
     // Show current time for 10 seconds
     {MODE_CURRENT_TIME, 0, 0, 0, 0, "", 10000},
     
+    // Play wave animation
+    {MODE_WAVE, 0, 0, 0, 0, "", 0},
+    
     // Play pendulum animation
-    {MODE_PENDULUM, 0, 0, 0, 0, "", 100},
+    {MODE_PENDULUM, 0, 0, 0, 0, "", 1000},
 
     // Play 11:11 animation
     {MODE_SPECIFIC_TIME, 11, 11, 0, 0, "", 15000},
 
-    {MODE_PENDULUM, 0, 0, 0, 0, "", 100},
+    {MODE_PENDULUM, 0, 0, 0, 0, "", 1000},
 
     // Show current time for 10 seconds
-    {MODE_CURRENT_TIME, 0, 0, 0, 0, "", 10000},
-    
+    {MODE_CURRENT_TIME, 0, 0, 0, 0, "", 30000},
     
     // Play 11:11 animation
     {MODE_SPECIFIC_TIME, 4, 20, 0, 0, "", 10000},
 
+    // Play wave animation
+    {MODE_WAVE, 0, 0, 0, 0, "", 0},
+
     // Show current time for 10 seconds
-    {MODE_CURRENT_TIME, 0, 0, 0, 0, "", 10000},
+    {MODE_CURRENT_TIME, 0, 0, 0, 0, "", 20000},
     
     // Play 11:11 animation
     {MODE_SPECIFIC_TIME, 2, 22, 0, 0, "", 10000},
 
     // Show current time for 10 seconds
-    {MODE_CURRENT_TIME, 0, 0, 0, 0, "", 10000},
+    {MODE_CURRENT_TIME, 0, 0, 0, 0, "", 15000},
+
+    // Play wave animation
+    {MODE_WAVE, 0, 0, 0, 0, "", 0},
     
     // Play 11:11 animation
     {MODE_SPECIFIC_TIME, 3, 33, 0, 0, "", 5000},
 
     {MODE_PENDULUM, 0, 0, 0, 0, "", 100},
+
+    // Show current time for 10 seconds
+    {MODE_CURRENT_TIME, 0, 0, 0, 0, "", 20000},
+
+    // Play wave animation
+    {MODE_WAVE, 0, 0, 0, 0, "", 0},
+
+    // Play 11:11 animation
+    {MODE_SPECIFIC_TIME, 11, 50, 0, 0, "", 2000},
+    {MODE_SPECIFIC_TIME, 11, 51, 0, 0, "", 2000},
+
+    // Play 11:11 animation
+    {MODE_SPECIFIC_TIME, 11, 52, 0, 0, "", 2000},
+
+    // Play 11:11 animation
+    {MODE_SPECIFIC_TIME, 11, 53, 0, 0, "", 2000},
+
+    // Play 11:11 animation
+    {MODE_SPECIFIC_TIME, 11, 54, 0, 0, "", 2000},
+    {MODE_SPECIFIC_TIME, 11, 55, 0, 0, "", 2000},
+
+    // Play 11:11 animation
+    {MODE_SPECIFIC_TIME, 11, 56, 0, 0, "", 2000},
+
+    // Play 11:11 animation
+    {MODE_SPECIFIC_TIME, 11, 57, 0, 0, "", 10000},
+
+    {MODE_SPECIFIC_TIME, 11, 58, 0, 0, "", 2000},
+
+    {MODE_SPECIFIC_TIME, 11, 59, 0, 0, "", 2000},
+
+    // Play wave animation
+    {MODE_WAVE, 0, 0, 0, 0, "", 0},
+
+    // Play wave animation
+    {MODE_WAVE, 0, 0, 0, 0, "", 0},
+
+    // Play wave animation
+    {MODE_WAVE, 0, 0, 0, 0, "", 0},
+
+    {MODE_PENDULUM, 0, 0, 0, 0, "", 100},
+
+    // Show current time for 10 seconds
+    {MODE_CURRENT_TIME, 0, 0, 0, 0, "", 15000},
+
+    {MODE_PENDULUM, 0, 0, 0, 0, "", 100},
+
+    // Play 11:11 animation
+    {MODE_DIRECT_ANGLE, 0, 0, 180.0f, 270.0f, "", 10000},
+
+    // Play wave animation
+    {MODE_WAVE, 0, 0, 0, 0, "", 0},
+
     
 };
 
@@ -398,11 +466,15 @@ static void debug_msg(const char *format, ...) {
 
 // Convert time to clock hand angles
 static void time_to_angles(int hour, int minute, float &hour_angle, float &minute_angle) {
-    // Minute hand: 360° ÷ 60 minutes = 6° per minute
-    minute_angle = minute * 6.0f;
+    // Minute hand: 360° ÷ 60 minutes = 6° per minute + offset
+    minute_angle = minute * 6.0f + clock_position_offset;
     
-    // Hour hand: 360° ÷ 12 hours = 30° per hour + 0.5° per minute
-    hour_angle = (hour % 12) * 30.0f + minute * 0.5f;
+    // Hour hand: 360° ÷ 12 hours = 30° per hour + 0.5° per minute + offset
+    hour_angle = (hour % 12) * 30.0f + minute * 0.5f + clock_position_offset;
+    
+    // Normalize angles to 0-360 range
+    while (minute_angle >= 360.0f) minute_angle -= 360.0f;
+    while (hour_angle >= 360.0f) hour_angle -= 360.0f;
 }
 
 // Move clock hands to specific angles - direct linear movement with shortest path
@@ -710,31 +782,31 @@ static void play_pendulum_animation() {
         {original_minute_angle + 15, original_hour_angle + 8}, 
         
         // Fall phase - minute hand falls faster due to less weight
-        {180, 165},                                           
-        
+        {180 + clock_position_offset, 165 + clock_position_offset},                                           
+    
         // First swing - minute hand swings further due to less mass
-        {210, 195},                                           
-        
+        {210 + clock_position_offset, 195 + clock_position_offset},                                           
+    
         // First back swing - minute hand overshoots more
-        {150, 160},                                           
-        
+        {150 + clock_position_offset, 160 + clock_position_offset},                                           
+    
         // Second swing - minute hand still swings wider
-        {200, 188},                                           
-        
+        {200 + clock_position_offset, 188 + clock_position_offset},                                           
+    
         // Second back swing - starting to synchronize
-        {160, 170},                                           
-        
+        {160 + clock_position_offset, 170 + clock_position_offset},                                           
+    
         // Third swing - getting closer in phase
-        {190, 184},                                           
-        
+        {190 + clock_position_offset, 184 + clock_position_offset},                                           
+    
         // Third back swing - almost synchronized
-        {170, 175},                                           
-        
+        {170 + clock_position_offset, 175 + clock_position_offset},                                           
+    
         // Tiny final oscillation
-        {182, 180},                                           
-        
+        {182 + clock_position_offset, 180 + clock_position_offset},                                           
+    
         // Final settling at 6:00
-        {180, 180}
+        {180 + clock_position_offset, 180 + clock_position_offset}
     };
     
     // Speed multipliers for natural physics-based motion
@@ -755,11 +827,11 @@ static void play_pendulum_animation() {
     // Part 2: Return movement after pause
     float pendulum_positions_return[][2] = {
         // Starting from settled position
-        {180, 180},
+        {180 + clock_position_offset, 180 + clock_position_offset},
         
         // Wake-up jolt - minute hand reacts more
-        {155, 165},                                           
-        
+        {155 + clock_position_offset, 165 + clock_position_offset},                                           
+    
         // Return to original time
         {original_minute_angle, original_hour_angle}          
     };
@@ -792,6 +864,75 @@ static void play_pendulum_animation() {
     
     debug_msg("Pendulum animation complete");
 }
+
+
+
+// Add this function around line 800 with other animations
+static void play_wave_animation() {
+    debug_msg("Playing wave animation");
+    
+    // Store current time for returning later
+    float original_hour_angle, original_minute_angle;
+    time_to_angles(current_hour, current_minute, original_hour_angle, original_minute_angle);
+    
+    // Save current movement parameters
+    float saved_speed = movement_speed;
+    float saved_accel = movement_accel;
+    
+    // Use very fluid acceleration for smooth waves
+    movement_accel = 0.5f;
+    
+    // Wave positions - minute hand waves more dramatically than hour hand
+    float wave_positions[][2] = {
+        // Starting position
+        {original_minute_angle, original_hour_angle},
+        
+        // First wave right
+        {original_minute_angle + 60, original_hour_angle + 30},
+        
+        // First wave left
+        {original_minute_angle - 60, original_hour_angle - 30},
+        
+        // Second wave right (smaller)
+        {original_minute_angle + 30, original_hour_angle + 15},
+        
+        // Second wave left (smaller)
+        {original_minute_angle - 30, original_hour_angle - 15},
+        
+        // Third wave right (even smaller)
+        {original_minute_angle + 15, original_hour_angle + 4},
+        
+        // Third wave left (even smaller)
+        {original_minute_angle - 15, original_hour_angle - 4},
+        
+        // Return to original position
+        {original_minute_angle, original_hour_angle}
+    };
+    
+    // Speed multipliers for natural wave motion
+    float wave_speeds[] = {
+        1.0f,  // Start normal
+        2.5f,  // First wave right (quick)
+        2.5f,  // First wave left (quick)
+        2.0f,  // Second wave right (medium)
+        2.0f,  // Second wave left (medium)
+        1.5f,  // Third wave right (slower)
+        1.5f,  // Third wave left (slower)
+        1.0f   // Return to normal
+    };
+    
+    // Execute the wave animation
+    movement_speed = 180.0f;
+    move_continuous_sequence(wave_positions, 8, wave_speeds);
+    
+    // Restore original speed settings
+    movement_speed = saved_speed;
+    movement_accel = saved_accel;
+    
+    debug_msg("Wave animation complete");
+}
+
+
 
 // Ultra-reliable forward spin animation with failsafes
 static void play_rewind_animation() {
@@ -1071,6 +1212,13 @@ static void advance_sequence() {
             // Immediately advance to next step after animation completes
             advance_sequence();
             break;
+            
+        case MODE_WAVE:
+            debug_msg("Sequence: Starting wave animation");
+            play_wave_animation();
+            // Immediately advance to next step after animation completes
+            advance_sequence();
+            break;
     }
 }
 
@@ -1257,8 +1405,13 @@ void clockEngineTask(void* parameter) {
             }
             
             // 4. Move to 0,0 (12 o'clock position) after both axes are homed
-            debug_msg("Homing complete, moving to 12 o'clock position (0,0)");
-            move_to_angles(0, 0);
+            debug_msg("Homing complete, moving to 12:00 position (0,0)");
+            // Move to 12:00 position after homing (with offset)
+            debug_msg("Moving to 12:00 position after homing (offset: %.1f°)", clock_position_offset);
+            char cmd[64];
+            snprintf(cmd, sizeof(cmd)-1, "G1 X%.1f Y%.1f F3600", 
+                     clock_position_offset, clock_position_offset);
+            send_gcode(cmd);
             vTaskDelay(3000 / portTICK_PERIOD_MS);
             
             // 5. Mark homing as complete
@@ -1273,31 +1426,31 @@ void clockEngineTask(void* parameter) {
             // Test HOUR hand (Y axis) - with ultra-fluid motion
             debug_msg("Testing HOUR hand (Y axis)");
             movement_speed = 150.0f;
-            movement_accel = 6.0f;  // Was 30.0f (5x reduction)
-            move_to_angles(0, 90);    // Hour hand at 3:00
+            movement_accel = 6.0f;
+            move_to_angles(clock_position_offset, 90 + clock_position_offset);    // Hour hand at 3:00
             vTaskDelay(500 / portTICK_PERIOD_MS);
             movement_speed = 120.0f;
-            movement_accel = 5.0f;  // Was 25.0f (5x reduction)
-            move_to_angles(0, 180);   // Hour hand at 6:00
+            movement_accel = 5.0f;
+            move_to_angles(clock_position_offset, 180 + clock_position_offset);   // Hour hand at 6:00
             vTaskDelay(500 / portTICK_PERIOD_MS);
             movement_speed = 180.0f;
-            movement_accel = 4.0f;  // Was 20.0f (5x reduction)
-            move_to_angles(0, 270);   // Hour hand at 9:00
+            movement_accel = 4.0f;
+            move_to_angles(clock_position_offset, 270 + clock_position_offset);   // Hour hand at 9:00
             vTaskDelay(500 / portTICK_PERIOD_MS);
             movement_speed = 210.0f;
-            movement_accel = 7.0f;  // Was 35.0f (5x reduction)
-            move_to_angles(0, 0);     // Hour hand at 12:00
+            movement_accel = 7.0f;
+            move_to_angles(clock_position_offset, clock_position_offset);     // Hour hand at 12:00
             vTaskDelay(1000 / portTICK_PERIOD_MS);
             
             // Test MINUTE hand (X axis) - moving to 4 cardinal positions
             debug_msg("Testing MINUTE hand (X axis)");
-            move_to_angles(90, 0);    // Minute hand at 3:00
+            move_to_angles(90 + clock_position_offset, clock_position_offset);    // Minute hand at 3:00
             vTaskDelay(500 / portTICK_PERIOD_MS);
-            move_to_angles(180, 0);   // Minute hand at 6:00
+            move_to_angles(180 + clock_position_offset, clock_position_offset);   // Minute hand at 6:00
             vTaskDelay(500 / portTICK_PERIOD_MS);
-            move_to_angles(270, 0);   // Minute hand at 9:00
+            move_to_angles(270 + clock_position_offset, clock_position_offset);   // Minute hand at 9:00
             vTaskDelay(500 / portTICK_PERIOD_MS);
-            move_to_angles(0, 0);     // Minute hand at 12:00
+            move_to_angles(clock_position_offset, clock_position_offset);     // Minute hand at 12:00
             vTaskDelay(1000 / portTICK_PERIOD_MS);
             
             // Finally, move both hands to starting position
@@ -1485,7 +1638,7 @@ static void move_continuous_sequence(const float positions[][2], int num_positio
     memset(cmd, 0, sizeof(cmd));
     snprintf(cmd, sizeof(cmd)-1, "$120=%.2f", effect_accel);
     if (!send_gcode(cmd)) {
-        debug_msg("WARNING: Failed to set acceleration, continuing anyway");
+        //debug_msg("WARNING: Failed to set acceleration, continuing anyway");
         // Don't retry - just continue with current settings
     }
     vTaskDelay(100 / portTICK_PERIOD_MS); // Longer delay
@@ -1493,7 +1646,7 @@ static void move_continuous_sequence(const float positions[][2], int num_positio
     memset(cmd, 0, sizeof(cmd));
     snprintf(cmd, sizeof(cmd)-1, "$121=%.2f", effect_accel);
     if (!send_gcode(cmd)) {
-        debug_msg("WARNING: Failed to set acceleration, continuing anyway");
+        //debug_msg("WARNING: Failed to set acceleration, continuing anyway");
         // Don't retry - just continue with current settings
     }
     vTaskDelay(100 / portTICK_PERIOD_MS); // Longer delay
@@ -1814,7 +1967,7 @@ static void get_current_position(float &x, float &y) {
     while (x < 0) x += 360.0f;
     while (x >= 360) x -= 360.0f;
     while (y < 0) y += 360.0f;
-    while (y >= 360) y -= 360.0f;
+          while (y >= 360) y -= 360.0f;
 }
 
 // Add this function to periodically verify position
@@ -1903,7 +2056,10 @@ void rehome_clock() {
     debug_msg("Moving to safe position before homing");
     send_gcode("G90");  // Absolute positioning
     vTaskDelay(100 / portTICK_PERIOD_MS);
-    send_gcode("G1 X180 Y180 F10800");  // Move to 6:00 position slowly
+    char safe_cmd[64];
+    snprintf(safe_cmd, sizeof(safe_cmd)-1, "G1 X%.1f Y%.1f F10800", 
+             180 + clock_position_offset, 180 + clock_position_offset);  // Move to 6:00 position with offset
+    send_gcode(safe_cmd);
     vTaskDelay(3000 / portTICK_PERIOD_MS);
     
     // Home hour hand (Y axis) first
@@ -1942,9 +2098,12 @@ void rehome_clock() {
         debug_msg("X axis homing complete");
     }
     
-    // Move to 12:00 position after homing
-    debug_msg("Moving to 12:00 position after homing");
-    send_gcode("G1 X0 Y0 F3600");  // Slow, controlled movement
+    // Move to 12:00 position after homing (with offset)
+    debug_msg("Moving to 12:00 position after homing (offset: %.1f°)", clock_position_offset);
+    char cmd[64];
+    snprintf(cmd, sizeof(cmd)-1, "G1 X%.1f Y%.1f F3600", 
+             clock_position_offset, clock_position_offset);
+    send_gcode(cmd);
     vTaskDelay(3000 / portTICK_PERIOD_MS);
     
     // Update system status
@@ -1962,3 +2121,4 @@ void rehome_clock() {
     // Verify position matches current time
     //verify_and_correct_time_position();
 }
+
